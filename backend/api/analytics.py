@@ -19,7 +19,7 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from database.models import Finding, Case, CaseClosureInfo, LLMInteractionLog
-from database.connection import get_db, get_db_session
+from database.connection import get_db, get_db_session
 from backend.services.ai_insights_service import AIInsightsService
 from services.mitre_lookup import get_time_range, resolve_technique  # noqa: F401
 
@@ -31,7 +31,7 @@ ai_insights_service = AIInsightsService()
 
 @router.get("/analytics")
 async def get_analytics(
-    time_range: str = Query("7d", regex="^(24h|7d|30d|all)$"),
+    time_range: str = Query("7d", pattern="^(24h|7d|30d|all)$"),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
