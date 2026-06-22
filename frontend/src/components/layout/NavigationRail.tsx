@@ -131,7 +131,7 @@ export default function NavigationRail({
                 letterSpacing: '-0.02em',
               }}
             >
-              AI-SOC
+              Vigil SOC
             </Typography>
           )}
         </Box>
