@@ -59,8 +59,8 @@ services:
       - BIFROST_URL=${BIFROST_URL:-http://bifrost:8080}
       - REDIS_URL=redis://redis:6379/0
       - PYTHONUNBUFFERED=1
-      - DEV_MODE=true
-      - JWT_SECRET_KEY=dev-secret-key-123456789
+      - DEV_MODE=${DEV_MODE:-false}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-dev-secret-key-123456789}
     ports:
       - "6987:6987"
     depends_on:
@@ -185,8 +185,8 @@ services:
       - BIFROST_URL=${BIFROST_URL:-http://bifrost:8080}
       - REDIS_URL=redis://redis:6379/0
       - PYTHONUNBUFFERED=1
-      - DEV_MODE=true
-      - JWT_SECRET_KEY=dev-secret-key-123456789
+      - DEV_MODE=${DEV_MODE:-false}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-dev-secret-key-123456789}
     depends_on:
       postgres:
         condition: service_healthy
