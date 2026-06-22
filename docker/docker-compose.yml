@@ -61,6 +61,8 @@ services:
       - PYTHONUNBUFFERED=1
       - DEV_MODE=${DEV_MODE:-false}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:-dev-secret-key-123456789}
+      - VIGIL_COOKIE_SECURE=${VIGIL_COOKIE_SECURE:-false}
+      - VIGIL_COOKIE_SAMESITE=${VIGIL_COOKIE_SAMESITE:-none}
     ports:
       - "6987:6987"
     depends_on:
