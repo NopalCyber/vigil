@@ -67,7 +67,7 @@ services:
       - SENTINELONE_CONSOLE_URL=${SENTINELONE_CONSOLE_URL:-}
       - UV_CACHE_DIR=/tmp/uv-cache
       - UV_TOOL_DIR=/tmp/uv-tools
-      - HOME=/tmp
+      - HOME=/app
     ports:
       - "6987:6987"
     depends_on:
@@ -83,7 +83,7 @@ services:
     volumes:
       - ../logs:/app/logs
       - ../.deeptempo:/app/.deeptempo
-      - vigil_secrets:/tmp/.vigil
+      - vigil_secrets:/app/.vigil
       - ../mcp-config.json:/app/mcp-config.json:ro
 
   # SOC Daemon - Autonomous monitoring and response
@@ -214,7 +214,7 @@ services:
     volumes:
       - ../logs:/app/logs
       - ../.deeptempo:/app/.deeptempo
-      - vigil_secrets:/tmp/.vigil
+      - vigil_secrets:/app/.vigil
       - ../mcp-config.json:/app/mcp-config.json:ro
 
   # ─── Multi-provider LLM gateway ───────────────────────────────────────────
