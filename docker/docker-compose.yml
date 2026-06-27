@@ -82,7 +82,7 @@ services:
       - deeptempo-network
     volumes:
       - ../logs:/app/logs
-      - ../.deeptempo:/app/.deeptempo
+      - vigil_data:/app/.deeptempo
       - vigil_secrets:/app/.vigil
       - ../mcp-config.json:/app/mcp-config.json:ro
 
@@ -213,7 +213,7 @@ services:
       - deeptempo-network
     volumes:
       - ../logs:/app/logs
-      - ../.deeptempo:/app/.deeptempo
+      - vigil_data:/app/.deeptempo
       - vigil_secrets:/app/.vigil
       - ../mcp-config.json:/app/mcp-config.json:ro
 
@@ -405,6 +405,8 @@ services:
 
 volumes:
   vigil_secrets:
+    driver: local
+  vigil_data:
     driver: local
   postgres_data:
     driver: local

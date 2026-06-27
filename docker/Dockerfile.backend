@@ -100,7 +100,8 @@ RUN mkdir -p /app/data/investigations \
              /app/data/mempalace \
              /app/logs \
              /app/.vigil \
-    && chown -R vigil:vigil /app/data /app/logs /app/.vigil
+             /app/.deeptempo \
+    && chown -R vigil:vigil /app/data /app/logs /app/.vigil /app/.deeptempo
 
 # Bake version into the image so `backend.__version__` resolves at import time
 # (backend/__init__.py reads VERSION from disk)
