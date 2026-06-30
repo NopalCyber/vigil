@@ -65,6 +65,16 @@ class SentinelOneIngestion(SIEMIngestionService):
             or os.environ.get("SENTINELONE_API_TOKEN")
             or ""
         )
+        # Daemon may start before the backend writes secrets.enc. If both values
+        # are still empty, attempt one lazy reload from the encrypted store.
+        if not url or not token:
+            try:
+                from services.integration_secrets import restore_all_integration_secrets
+                restore_all_integration_secrets()
+                url = (os.environ.get("SENTINELONE_CONSOLE_URL") or "").rstrip("/")
+                token = os.environ.get("SENTINELONE_API_TOKEN") or ""
+            except Exception:
+                pass
         return url, token
 
     def _headers(self) -> Dict[str, str]:
