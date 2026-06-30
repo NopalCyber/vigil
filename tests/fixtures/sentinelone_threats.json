@@ -1,0 +1,50 @@
+[
+  {
+    "id": "threat-001-abc",
+    "threatInfo": {
+      "threatName": "Cobalt Strike Beacon",
+      "classification": "Trojan",
+      "confidenceLevel": "malicious",
+      "createdAt": "2026-06-30T10:00:00.000000Z",
+      "mitigationStatus": "active",
+      "md5": "d41d8cd98f00b204e9800998ecf8427e",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "processUser": "SYSTEM"
+    },
+    "agentRealtimeInfo": {
+      "agentComputerName": "WORKSTATION-WIN10",
+      "agentIp": "10.1.2.3",
+      "agentId": "agent-xyz-001"
+    },
+    "agentDetectionInfo": {
+      "agentIpV4": "10.1.2.3"
+    }
+  },
+  {
+    "id": "threat-002-def",
+    "threatInfo": {
+      "threatName": "WannaCry Ransomware",
+      "classification": "Ransomware",
+      "confidenceLevel": "malicious",
+      "createdAt": "2026-06-30T10:05:00.000000Z",
+      "mitigationStatus": "mitigated",
+      "sha256": "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+    },
+    "agentRealtimeInfo": {
+      "agentComputerName": "SERVER-DC01",
+      "agentIp": "192.168.1.10",
+      "agentId": "agent-xyz-002"
+    },
+    "agentDetectionInfo": {}
+  },
+  {
+    "id": "threat-003-ghi",
+    "threatName": "PUA.Gen",
+    "classification": "PUA",
+    "confidenceLevel": "suspicious",
+    "createdAt": "2026-06-30T10:10:00.000000Z",
+    "mitigationStatus": "blocked",
+    "agentComputerName": "LAPTOP-USER01",
+    "agentIp": "172.16.0.50"
+  }
+]

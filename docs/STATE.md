@@ -109,6 +109,29 @@ The seed `docker/bifrost/config.json` still references `env.*` for
 first-boot provider/model definitions, but the actual key *values* are
 overwritten at runtime.
 
+### LLM provider routing
+
+All AI features that generate text route through `LLMRouter.dispatch()`
+with the provider resolved by `get_default_provider_spec()`. This covers:
+
+| Feature | Endpoint | Notes |
+|---|---|---|
+| Chat | `POST /api/claude/chat` | Primary path; streaming supported |
+| Finding enrichment | `POST /api/findings/{id}/enrich` | Provider-agnostic since June 2026 |
+| Agent runs | `POST /api/agents/{id}/run` | Routes through ClaudeService or LLMRouter |
+| Workflows | `POST /api/workflows/{id}/execute` | ClaudeService; Anthropic-only |
+
+`LLMRouter` dispatches Anthropic requests to Bifrost's `/anthropic`
+passthrough (preserving extended thinking and prompt caching) and all
+other provider types to Bifrost's `/v1` OpenAI-format endpoint.
+
+**Prior to June 2026,** the finding enrichment endpoint hardcoded
+`ClaudeService.has_api_key()` (Anthropic-only), so OpenAI/Ollama
+deployments got a 503 even when a valid default provider was configured.
+The fix replaced that gate with `get_default_provider_spec()` +
+`LLMRouter.dispatch()` and preserved the legacy env-var ClaudeService
+path as a fallback for installations without a DB-configured provider.
+
 ## Workdirs and logs
 
 - `data/investigations/` — orchestrator working files (investigation

@@ -306,18 +306,19 @@ async def bulk_enrich_findings(request: BulkEnrichmentRequest):
 async def get_or_generate_enrichment(finding_id: str, force_regenerate: bool = Query(False)):
     """
     Get or generate AI enrichment for a finding.
-    
-    This endpoint checks if AI enrichment already exists for the finding.
-    If it exists, returns the cached enrichment immediately.
-    If not, generates new enrichment using Claude AI, caches it, and returns it.
-    
+
+    Returns cached enrichment when available. Otherwise generates new enrichment
+    using the default active LLM provider (configured in Settings → AI / LLM
+    Providers) via LLMRouter, then caches it. Supports Anthropic, OpenAI,
+    Ollama, and any other provider type configured in the UI.
+
     Args:
         finding_id: The finding ID to enrich
         force_regenerate: Force regeneration even if enrichment exists
-    
+
     Returns:
         AI enrichment data with threat analysis, impact, recommendations, etc.
-    
+
     Example Response:
         {
             "finding_id": "f-20260114-001",
@@ -328,7 +329,9 @@ async def get_or_generate_enrichment(finding_id: str, force_regenerate: bool = Q
                 "recommended_actions": [...],
                 "related_techniques": [...],
                 "indicators": {...},
-                "confidence_score": 0.85
+                "confidence_score": 0.85,
+                "model": "claude-sonnet-4-6",
+                "generated_at": "2026-06-30T10:00:00Z"
             }
         }
     """
@@ -350,17 +353,14 @@ async def get_or_generate_enrichment(finding_id: str, force_regenerate: bool = Q
             "enrichment": existing_enrichment
         }
     
-    # Generate new enrichment using Claude
+    # Generate new enrichment using the active LLM provider.
+    # Routes through LLMRouter (same as /api/claude/chat) so any provider
+    # configured in Settings → AI / LLM Providers works — not just Anthropic.
     try:
-        from services.claude_service import ClaudeService
-        
-        claude_service = ClaudeService(use_backend_tools=True, use_mcp_tools=False)
-        
-        # Check if API key is configured
-        if not claude_service.has_api_key():
-            from backend.api.claude import NO_PROVIDER_DETAIL
+        from services.llm_router import LLMRouter, get_default_provider_spec
+        from backend.api.claude import NO_PROVIDER_DETAIL
 
-            raise HTTPException(status_code=503, detail=NO_PROVIDER_DETAIL)
+        _provider = get_default_provider_spec()
         
         # Extract finding details (use `or` to guard against keys present with None values)
         severity = finding.get('severity') or 'unknown'
@@ -473,25 +473,47 @@ Please provide a detailed analysis in the following JSON structure:
 
 Respond ONLY with valid JSON. Be specific and actionable. Focus on helping a SOC analyst make quick, informed decisions."""
 
-        # Generate enrichment
+        # Generate enrichment via the active provider
         logger.info(f"Generating AI enrichment for {finding_id}")
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: claude_service.chat(
-                message=prompt,
-                model=DEFAULT_MODEL,
-                max_tokens=4096
+        _used_model = DEFAULT_MODEL
+        if _provider is not None:
+            # LLMRouter handles all provider types — Anthropic goes through
+            # Bifrost's /anthropic passthrough; OpenAI/Ollama use /v1.
+            # Pass model=None so each provider uses its own default_model
+            # rather than a DEFAULT_MODEL value that may target a different
+            # provider family (e.g. "gpt-4o" would fail against Anthropic).
+            _result = await LLMRouter().dispatch(
+                provider=_provider,
+                messages=[{"role": "user", "content": prompt}],
+                model=None,
+                max_tokens=4096,
             )
-        )
+            response = _result.get("content", "")
+            _used_model = _result.get("model") or getattr(_provider, "default_model", DEFAULT_MODEL)
+        else:
+            # No UI-configured provider — fall back to ClaudeService
+            # (picks up ANTHROPIC_API_KEY / CLAUDE_API_KEY from env/secrets).
+            from services.claude_service import ClaudeService
+            claude_service = ClaudeService(use_backend_tools=False, use_mcp_tools=False)
+            if not claude_service.has_api_key():
+                raise HTTPException(status_code=503, detail=NO_PROVIDER_DETAIL)
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: claude_service.chat(
+                    message=prompt,
+                    model=DEFAULT_MODEL,
+                    max_tokens=4096,
+                )
+            )
+
+        if not response:
+            raise HTTPException(status_code=503, detail=NO_PROVIDER_DETAIL)
         
         # Parse JSON response
         import json
         import re
-        
-        if not response:
-            raise ValueError("Claude API returned an empty response")
-        
+
         # Try to extract JSON from response (handle markdown code blocks)
         json_match = re.search(r'```json\s*(\{.*?\})\s*```', response, re.DOTALL)
         if json_match:
@@ -526,7 +548,7 @@ Respond ONLY with valid JSON. Be specific and actionable. Focus on helping a SOC
         
         # Add metadata
         enrichment['generated_at'] = datetime.utcnow().isoformat() + 'Z'
-        enrichment['model'] = DEFAULT_MODEL
+        enrichment['model'] = _used_model
         
         # Save enrichment to database
         success = data_service.update_finding(finding_id, ai_enrichment=enrichment)
@@ -543,10 +565,12 @@ Respond ONLY with valid JSON. Be specific and actionable. Focus on helping a SOC
             "enrichment": enrichment
         }
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error generating enrichment for {finding_id}: {e}")
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail=f"Failed to generate enrichment: {str(e)}"
         )
 

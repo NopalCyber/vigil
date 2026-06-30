@@ -165,6 +165,36 @@ All agents can submit actions to the approval queue:
 | 0.70-0.84 | Requires manual approval |
 | < 0.70 | Monitor only |
 
+## Finding Enrichment
+
+`POST /api/findings/{id}/enrich` generates a structured AI analysis of a
+finding: threat summary, impact, recommended actions, related MITRE
+techniques, and IOC extraction.
+
+Enrichment uses the **default active LLM provider** configured in
+**Settings → AI / LLM Providers** — it is not Anthropic-specific. Any
+provider type (Anthropic, OpenAI, Ollama, etc.) set as the default will
+be used. The response includes a `model` field showing which model
+actually generated the enrichment.
+
+| Field | Description |
+|---|---|
+| `threat_summary` | 2-3 sentence summary of the finding |
+| `threat_type` | Classification (Malware, Lateral Movement, C2, etc.) |
+| `potential_impact` | Impact to the organisation |
+| `risk_level` | Critical / High / Medium / Low |
+| `recommended_actions` | Ordered list of immediate and follow-up steps |
+| `investigation_questions` | Questions to guide the analyst |
+| `indicators` | Extracted IPs, domains, users, processes |
+| `related_techniques` | MITRE ATT&CK technique IDs with relevance |
+| `timeline_context` | Likely sequence of events |
+| `confidence_score` | Model confidence (0–1) |
+| `model` | Model that generated this enrichment |
+| `generated_at` | ISO-8601 generation timestamp |
+
+Enrichment is cached in `findings.ai_enrichment`. Use
+`?force_regenerate=true` to re-run even when a cached result exists.
+
 ## Backend Tools by Agent (Agent SDK)
 
 All agents use these tools via Claude API function calling:

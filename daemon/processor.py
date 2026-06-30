@@ -366,7 +366,24 @@ REASONING: [Brief explanation]
             logger.warning("LLM gateway unavailable, skipping AI triage")
             return None
         try:
-            result = await self._llm_gateway.submit_triage(prompt)
+            # Resolve the active provider + model via the registry fallback chain:
+            # ai_model_configs["triage"] → ai_model_configs["chat_default"]
+            # → default active provider (Settings → AI/LLM Providers)
+            provider_id = None
+            model = None
+            try:
+                from services.model_registry import get_registry
+                pick = get_registry().resolve_model_for_component("triage")
+                if pick is not None:
+                    provider_id, model = pick
+            except Exception as reg_err:
+                logger.debug("Model registry lookup failed, using default: %s", reg_err)
+
+            result = await self._llm_gateway.submit_triage(
+                prompt,
+                **({"model": model} if model else {}),
+                **({"provider_id": provider_id} if provider_id else {}),
+            )
             if result is None:
                 return None
             if isinstance(result, dict):

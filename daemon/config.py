@@ -15,6 +15,7 @@ class PollingConfig:
     """Configuration for data source polling intervals."""
     splunk_interval: int = 300  # 5 minutes
     crowdstrike_interval: int = 60  # 1 minute
+    sentinelone_interval: int = 60  # 1 minute — EDR cadence, matches CrowdStrike
     generic_interval: int = 120  # 2 minutes for other sources
     webhook_enabled: bool = True
     webhook_port: int = 8081
@@ -167,6 +168,7 @@ class DaemonConfig:
         # Polling intervals
         config.polling.splunk_interval = int(os.getenv("DAEMON_SPLUNK_POLL_INTERVAL", "300"))
         config.polling.crowdstrike_interval = int(os.getenv("DAEMON_CROWDSTRIKE_POLL_INTERVAL", "60"))
+        config.polling.sentinelone_interval = int(os.getenv("DAEMON_SENTINELONE_POLL_INTERVAL", "60"))
         config.polling.webhook_enabled = os.getenv("DAEMON_WEBHOOK_ENABLED", "true").lower() == "true"
         config.polling.webhook_port = int(os.getenv("DAEMON_WEBHOOK_PORT", "8081"))
         

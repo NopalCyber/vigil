@@ -109,6 +109,10 @@ services:
       # Polling intervals (seconds)
       - DAEMON_SPLUNK_POLL_INTERVAL=${DAEMON_SPLUNK_POLL_INTERVAL:-300}
       - DAEMON_CROWDSTRIKE_POLL_INTERVAL=${DAEMON_CROWDSTRIKE_POLL_INTERVAL:-60}
+      - DAEMON_SENTINELONE_POLL_INTERVAL=${DAEMON_SENTINELONE_POLL_INTERVAL:-60}
+      # SentinelOne credentials
+      - SENTINELONE_API_TOKEN=${SENTINELONE_API_TOKEN:-}
+      - SENTINELONE_CONSOLE_URL=${SENTINELONE_CONSOLE_URL:-}
       # Processing
       - DAEMON_AUTO_TRIAGE=${DAEMON_AUTO_TRIAGE:-true}
       - DAEMON_AUTO_ENRICH=${DAEMON_AUTO_ENRICH:-true}
@@ -174,6 +178,11 @@ services:
     restart: unless-stopped
     networks:
       - deeptempo-network
+    volumes:
+      - ../logs:/app/logs
+      - vigil_data:/app/.deeptempo
+      - vigil_secrets:/app/.vigil
+      - ../mcp-config.json:/app/mcp-config.json:ro
 
   # ARQ Worker - Processes LLM requests from the queue
   llm-worker:

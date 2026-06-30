@@ -39,7 +39,7 @@ Backend tools are automatically enabled for web UI users via the Claude Agent SD
 | SIEM | Splunk, Elastic Security | Implemented |
 | Timeline | Timesketch | Implemented |
 | Threat Intel | VirusTotal, Shodan, AlienVault OTX, MISP, URL Analysis, IP Geolocation | Implemented |
-| EDR | CrowdStrike | Implemented |
+| EDR | CrowdStrike, SentinelOne | Implemented |
 | Sandbox | Hybrid Analysis, Joe Sandbox, ANY.RUN, CAPE Sandbox | Implemented |
 | Ticketing | Jira | Implemented |
 | Communication | Slack | Implemented |
@@ -382,6 +382,65 @@ CS_CLIENT_SECRET="your_client_secret"
 
 Tools: `get_crowdstrike_alert_by_ip`, `crowdstrike_foundry_isolate`, `crowdstrike_foundry_unisolate`, `get_host_status`
 
+### SentinelOne
+
+Autonomous threat ingestion from SentinelOne Management API v2.1. The daemon polls every 60 seconds via the federation adapter and automatically triages new threats through the AI pipeline.
+
+#### Configuration
+
+Credentials are stored in the encrypted secrets store — do **not** put them in `.env`:
+
+**Settings → Integrations → SentinelOne:**
+- **Console URL** — your management console base URL, e.g. `https://usea1-002.sentinelone.net`
+- **API Token** — a service-user token with **Threats → View** permission
+
+Optional env-var overrides (fallback only; UI values take precedence):
+```bash
+SENTINELONE_CONSOLE_URL="https://usea1-002.sentinelone.net"
+SENTINELONE_API_TOKEN=""         # set via UI, not here
+DAEMON_SENTINELONE_POLL_INTERVAL=60
+```
+
+#### How it works
+
+| Path | Mechanism | When active |
+|------|-----------|-------------|
+| **Federation adapter** (primary) | `daemon/federation/adapters/sentinelone.py` polls via `GET /web/api/v2.1/threats` with cursor-based watermarking | Federation globally enabled (default) |
+| **Legacy polling loop** (fallback) | `daemon/poller.py` `_poll_sentinelone` with dedup set | Federation globally disabled |
+
+On first run, the adapter backfills the last **7 days** of threats. Subsequent ticks advance the cursor to the last ingested threat's `createdAt` timestamp, so partial fetches (`max_items < total`) pick up incrementally rather than jumping to "now."
+
+#### Severity mapping
+
+| SentinelOne confidence | Vigil severity | Exception |
+|------------------------|---------------|-----------|
+| `malicious` | `high` | `critical` when classification is Ransomware, Rootkit, Exploit, or ExploitKit |
+| `suspicious` | `medium` | — |
+| anything else | `low` | — |
+
+#### API versions supported
+
+Both nested v2.1 (`threatInfo` / `agentRealtimeInfo` sub-objects) and flat v2.0 layouts are handled with safe fallback chains throughout `transform_alert_to_finding`.
+
+#### Triggering a manual poll
+
+From the portal: **Settings → Integrations → SentinelOne → Poll Now**
+
+Or via API:
+```bash
+curl -X POST http://localhost:6987/api/federation/sources/sentinelone/poll-now
+```
+
+#### Resetting the ingestion window
+
+To re-ingest historical threats, reset the federation cursor:
+```sql
+UPDATE federation_sources
+SET cursor = '{}', last_success_at = NULL
+WHERE source_id = 'sentinelone';
+```
+The next poll will automatically apply the 7-day backfill.
+
 ## Communication
 
 ### Slack
@@ -575,6 +634,5 @@ Available for future implementation:
 | Azure AD | Identity |
 | Okta | Identity |
 | Microsoft Defender | EDR |
-| SentinelOne | EDR |
 | Carbon Black | EDR |
 | PagerDuty | Communication |

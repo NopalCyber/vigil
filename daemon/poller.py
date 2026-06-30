@@ -58,6 +58,7 @@ class DataPoller:
         self._aws_security_hub_state = PollState()
         self._microsoft_defender_state = PollState()
         self._elastic_state = PollState()
+        self._sentinelone_state = PollState()
         self._generic_state = PollState()
 
         # Durable per-source dedup sets (Redis-backed)
@@ -67,6 +68,7 @@ class DataPoller:
         self._aws_security_hub_dedup = RedisDedupSet("poller:aws_security_hub")
         self._microsoft_defender_dedup = RedisDedupSet("poller:microsoft_defender")
         self._elastic_dedup = RedisDedupSet("poller:elastic")
+        self._sentinelone_dedup = RedisDedupSet("poller:sentinelone")
         self._webhook_dedup = RedisDedupSet("poller:webhook")
 
         # Services (lazy loaded)
@@ -77,6 +79,7 @@ class DataPoller:
         self._aws_security_hub_service = None
         self._microsoft_defender_service = None
         self._elastic_service = None
+        self._sentinelone_service = None
 
         # Stats
         self.stats = {
@@ -92,6 +95,8 @@ class DataPoller:
             "microsoft_defender_findings": 0,
             "elastic_polls": 0,
             "elastic_findings": 0,
+            "sentinelone_polls": 0,
+            "sentinelone_findings": 0,
             "webhook_findings": 0,
             "errors": 0
         }
@@ -171,6 +176,15 @@ class DataPoller:
                 except Exception as e:
                     logger.warning(f"Failed to initialize Elastic Security service: {e}")
 
+            # Initialize SentinelOne service if configured
+            if is_integration_enabled('sentinelone'):
+                try:
+                    from services.sentinelone_ingestion import SentinelOneIngestion
+                    self._sentinelone_service = SentinelOneIngestion()
+                    logger.info("SentinelOne service initialized")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize SentinelOne service: {e}")
+
             # Initialize data service for database access
             from services.database_data_service import DatabaseDataService
             self._data_service = DatabaseDataService()
@@ -218,6 +232,11 @@ class DataPoller:
         if self._elastic_service:
             tasks.append(asyncio.create_task(
                 self._poll_elastic_loop(shutdown_event)
+            ))
+
+        if self._sentinelone_service:
+            tasks.append(asyncio.create_task(
+                self._poll_sentinelone_loop(shutdown_event)
             ))
 
         if self.config.webhook_enabled:
@@ -728,4 +747,63 @@ class DataPoller:
 
         except Exception as e:
             logger.error(f"Elastic Security API error: {e}")
+            raise
+
+    async def _poll_sentinelone_loop(self, shutdown_event: asyncio.Event):
+        """Poll SentinelOne for new threats on interval."""
+        interval = self.config.sentinelone_interval
+        logger.info(f"SentinelOne polling loop started (interval: {interval}s)")
+
+        while not shutdown_event.is_set():
+            try:
+                await self._poll_sentinelone()
+                self._sentinelone_state.last_poll_time = datetime.utcnow()
+            except Exception as e:
+                logger.error(f"SentinelOne polling error: {e}")
+                self.stats["errors"] += 1
+
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    async def _poll_sentinelone(self):
+        """Poll SentinelOne for new threats."""
+        if not self._sentinelone_service:
+            return
+        if self._federation.is_active_for("sentinelone"):
+            return  # Federation owns this source; skip to avoid double-polling
+
+        self.stats["sentinelone_polls"] += 1
+        logger.debug("Polling SentinelOne for new threats...")
+
+        try:
+            # First run (no prior poll): fetch last 7 days for initial backfill
+            if self._sentinelone_state.last_poll_time is None:
+                lookback_minutes = 7 * 24 * 60
+            else:
+                lookback_minutes = max(self.config.sentinelone_interval // 60 + 1, 2)
+            start_time = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+
+            threats = await self._sentinelone_service.fetch_alerts(
+                start_time=start_time, limit=100
+            )
+
+            new_count = 0
+            for threat in threats:
+                finding = self._sentinelone_service.transform_alert_to_finding(threat)
+                if finding and not await self._sentinelone_dedup.is_processed(
+                    finding["finding_id"]
+                ):
+                    await self._enqueue_finding(finding, "sentinelone")
+                    await self._sentinelone_dedup.mark_processed(finding["finding_id"])
+                    new_count += 1
+
+            if new_count > 0:
+                logger.info(f"Polled {new_count} new threats from SentinelOne")
+                self.stats["sentinelone_findings"] += new_count
+
+        except Exception as e:
+            logger.error(f"SentinelOne API error: {e}")
             raise

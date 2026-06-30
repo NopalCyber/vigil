@@ -142,6 +142,7 @@ def _ensure_builtins_loaded() -> None:
             crowdstrike,
             elastic,
             microsoft_defender,
+            sentinelone,
             splunk,
         )
     except Exception as e:

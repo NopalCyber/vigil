@@ -22,6 +22,21 @@ class SOCDaemon:
         self.config = config or DaemonConfig.from_env()
         self.config.setup_logging()
 
+        # Restore encrypted integration secrets into os.environ so all service
+        # classes that read credentials via get_integration_config / os.environ
+        # can find them. Secrets are stored in ~/.vigil/secrets.enc by the
+        # backend when the user saves credentials in Settings → Integrations.
+        try:
+            from services.integration_secrets import restore_all_integration_secrets
+            result = restore_all_integration_secrets()
+            logger.info(
+                "Integration secrets restored: %d/%d loaded from encrypted store",
+                result.get("loaded", 0),
+                result.get("total", 0),
+            )
+        except Exception as _sec_err:
+            logger.warning("Failed to restore integration secrets (non-fatal): %s", _sec_err)
+
         # Initialize OTEL telemetry after logging is set up
         try:
             from core.telemetry import init_telemetry
