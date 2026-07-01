@@ -1,9 +1,8 @@
 """Auto-seed ``federation_sources`` rows on daemon boot.
 
-For every adapter whose underlying integration is configured, ensure a row
-exists with sensible defaults (default disabled — opt-in feature). Rows
-already present are left untouched, so user edits in the Federation UI
-survive restarts.
+Every registered adapter gets a skeleton row (default disabled) regardless
+of whether credentials are configured yet. Rows already present are left
+untouched so user edits in the Federation UI survive restarts.
 """
 
 from __future__ import annotations

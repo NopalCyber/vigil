@@ -98,7 +98,7 @@ def _ui_default_provider() -> Optional[tuple]:
 
         spec = get_default_provider_spec()
         if spec:
-            return (spec.provider_id, spec.model)
+            return (spec.provider_id, spec.default_model)
     except Exception as exc:
         logger.debug("UI default provider lookup failed: %s", exc)
     return None
@@ -117,8 +117,8 @@ class LLMRequest:
     thinking_budget: int = 10000
     tools: Optional[List[Dict]] = None
     temperature: Optional[float] = None
-    # Multi-provider routing (GH #88). None means "use the default
-    # anthropic provider" which preserves pre-#88 behavior.
+    # None means "use the UI-configured default provider"
+    # (resolved at submit time via _ui_default_provider()).
     provider_id: Optional[str] = None
     extra_kwargs: Dict[str, Any] = field(default_factory=dict)
 
