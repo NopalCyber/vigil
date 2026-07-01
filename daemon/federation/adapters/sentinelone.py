@@ -86,9 +86,20 @@ class SentinelOneAdapter:
                 last_created_at = ts
 
         if threats and last_created_at:
-            # Advance to the last ingested threat's timestamp so the next
-            # tick picks up immediately after it (incremental ingestion).
+            # Advance ONE SECOND past the last threat's createdAt.
+            # SentinelOne's createdAt__gte filter is inclusive, so storing the
+            # exact timestamp causes the same threat to be re-fetched on every
+            # subsequent poll. Adding 1 s makes the next query strictly after
+            # the last ingested event while still catching anything that arrived
+            # in the same second (sub-second arrivals are rare in practice and
+            # would be caught by the Redis dedup set anyway).
             ts_clean = last_created_at.rstrip("Z")
+            try:
+                ts_clean = (
+                    datetime.fromisoformat(ts_clean) + timedelta(seconds=1)
+                ).isoformat()
+            except Exception:
+                pass
             new_cursor: Dict[str, Any] = {"last_poll_at": ts_clean}
         elif threats:
             # Threats returned but no parseable timestamp — fall back to now.
