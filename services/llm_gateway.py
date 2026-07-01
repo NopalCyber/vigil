@@ -19,8 +19,6 @@ from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
 from arq.jobs import DeserializationError
 
-from services.defaults import DEFAULT_MODEL
-
 logger = logging.getLogger(__name__)
 
 QUEUE_NAME = "arq:llm"
@@ -88,12 +86,30 @@ class RedisSessionStore:
 # ---------------------------------------------------------------------------
 
 
+def _ui_default_provider() -> Optional[tuple]:
+    """Return (provider_id, model_id) from the UI-configured default provider.
+
+    Reads Settings → AI / LLM Providers (is_default=True AND is_active=True).
+    Returns None when no provider has been configured yet so callers can
+    skip gracefully rather than falling back to a hardcoded model name.
+    """
+    try:
+        from services.llm_router import get_default_provider_spec
+
+        spec = get_default_provider_spec()
+        if spec:
+            return (spec.provider_id, spec.model)
+    except Exception as exc:
+        logger.debug("UI default provider lookup failed: %s", exc)
+    return None
+
+
 @dataclass
 class LLMRequest:
     """Describes a single LLM call to be queued."""
 
     messages: List[Dict]
-    model: str = DEFAULT_MODEL
+    model: Optional[str] = None
     max_tokens: int = 4096
     system_prompt: Optional[str] = None
     session_id: Optional[str] = None
@@ -160,12 +176,19 @@ class LLMGateway:
         self,
         prompt: str,
         *,
-        model: str = DEFAULT_MODEL,
+        model: Optional[str] = None,
         max_tokens: int = 2048,
         timeout: int = 90,
         provider_id: Optional[str] = None,
     ) -> Optional[str]:
         """Enqueue a stateless triage call (highest priority)."""
+        if model is None or provider_id is None:
+            resolved = _ui_default_provider()
+            if resolved is None:
+                logger.warning("submit_triage: no active LLM provider configured in UI — skipping")
+                return None
+            provider_id = provider_id or resolved[0]
+            model = model or resolved[1]
         job = await self._pool.enqueue_job(
             "llm_call",
             messages=[{"role": "user", "content": prompt}],
@@ -196,7 +219,7 @@ class LLMGateway:
         inv_id: str,
         prompt: str,
         *,
-        model: str = DEFAULT_MODEL,
+        model: Optional[str] = None,
         max_tokens: int = 4096,
         enable_thinking: bool = True,
         thinking_budget: int = 8000,
@@ -209,6 +232,12 @@ class LLMGateway:
         Returns the full response dict including token counts so the
         agent runner can track cost.
         """
+        if model is None or provider_id is None:
+            resolved = _ui_default_provider()
+            if resolved is None:
+                raise RuntimeError("No active LLM provider configured — set one in Settings → AI / LLM Providers")
+            provider_id = provider_id or resolved[0]
+            model = model or resolved[1]
         job = await self._pool.enqueue_job(
             "llm_call",
             messages=[{"role": "user", "content": prompt}],
@@ -237,7 +266,7 @@ class LLMGateway:
         inv_id: str,
         messages: List[Dict],
         *,
-        model: str = DEFAULT_MODEL,
+        model: Optional[str] = None,
         max_tokens: int = 16000,
         enable_thinking: bool = True,
         thinking_budget: int = 8000,
@@ -251,6 +280,12 @@ class LLMGateway:
         Used by AgentRunner's tool-use loop where messages contain
         assistant + tool_result turns.
         """
+        if model is None or provider_id is None:
+            resolved = _ui_default_provider()
+            if resolved is None:
+                raise RuntimeError("No active LLM provider configured — set one in Settings → AI / LLM Providers")
+            provider_id = provider_id or resolved[0]
+            model = model or resolved[1]
         job = await self._pool.enqueue_job(
             "llm_call_raw",
             messages=messages,
@@ -286,7 +321,7 @@ class LLMGateway:
         messages: List[Dict],
         *,
         session_id: Optional[str] = None,
-        model: str = DEFAULT_MODEL,
+        model: Optional[str] = None,
         max_tokens: int = 4096,
         system_prompt: Optional[str] = None,
         enable_thinking: bool = False,
@@ -297,6 +332,12 @@ class LLMGateway:
         provider_id: Optional[str] = None,
     ) -> Any:
         """Enqueue a UI chat call (normal priority)."""
+        if model is None or provider_id is None:
+            resolved = _ui_default_provider()
+            if resolved is None:
+                raise RuntimeError("No active LLM provider configured — set one in Settings → AI / LLM Providers")
+            provider_id = provider_id or resolved[0]
+            model = model or resolved[1]
         job = await self._pool.enqueue_job(
             "llm_call",
             messages=messages,
@@ -324,13 +365,20 @@ class LLMGateway:
         self,
         prompt: str,
         *,
-        model: str = DEFAULT_MODEL,
+        model: Optional[str] = None,
         max_tokens: int = 2000,
         temperature: float = 0.3,
         timeout: int = 90,
         provider_id: Optional[str] = None,
     ) -> Optional[str]:
         """Enqueue a background insights/analytics call (lowest priority)."""
+        if model is None or provider_id is None:
+            resolved = _ui_default_provider()
+            if resolved is None:
+                logger.warning("submit_insights: no active LLM provider configured in UI — skipping")
+                return None
+            provider_id = provider_id or resolved[0]
+            model = model or resolved[1]
         job = await self._pool.enqueue_job(
             "llm_call",
             messages=[{"role": "user", "content": prompt}],
