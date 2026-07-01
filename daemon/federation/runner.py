@@ -122,6 +122,23 @@ class FederationRunner:
         while not shutdown_event.is_set():
             # Re-read DB state on every tick. Cheap enough at MVP cadence.
             row = store.get_source(source_id) or {}
+
+            # Self-heal: if the initial seed was skipped (DB not ready at boot),
+            # create the row now so it shows up in the Federation UI and can be
+            # enabled without a daemon restart.
+            if not row:
+                row = store.upsert_source(
+                    source_id,
+                    {
+                        "enabled": False,
+                        "interval_seconds": adapter.default_interval(),
+                        "max_items": 100,
+                        "min_severity": None,
+                        "cursor": {},
+                        "consecutive_errors": 0,
+                    },
+                ) or {}
+
             global_on = store.is_globally_enabled()
 
             if not (global_on and row.get("enabled")):

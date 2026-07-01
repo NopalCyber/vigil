@@ -18,17 +18,21 @@ logger = logging.getLogger(__name__)
 
 
 def seed_federation_sources() -> List[str]:
-    """Insert a row for each configured-but-unseen adapter.
+    """Insert a skeleton row for every registered adapter (if not already present).
+
+    Rows are seeded unconditionally regardless of whether credentials are
+    configured yet. The adapter's fetch() handles the unconfigured case
+    gracefully (returns empty findings, preserves cursor). Starting all rows
+    as disabled means they are inert until the operator enables them via
+    Settings → Federation — at which point the runner picks them up within
+    one idle tick (~5 s) without any daemon restart.
 
     Returns the list of source_ids touched (created or already-existing).
-    Failures on individual sources are logged and skipped — a bad integration
-    config can't break the rest of the seed pass.
+    Failures on individual sources are logged and skipped.
     """
     seeded: List[str] = []
     for adapter in list_adapters():
         try:
-            if not adapter.is_configured():
-                continue
             row = upsert_source(
                 adapter.name,
                 {
