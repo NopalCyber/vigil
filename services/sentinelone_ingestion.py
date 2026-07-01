@@ -88,14 +88,14 @@ class SentinelOneIngestion(SIEMIngestionService):
         self,
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
-        limit: int = 100,
+        limit: int = 1000,
     ) -> List[Dict[str, Any]]:
-        """Fetch threats from SentinelOne API v2.1.
+        """Fetch threats from SentinelOne API v2.1 with automatic pagination.
 
         Args:
             start_time: Only return threats created after this time.
             end_time:   Only return threats created before this time.
-            limit:      Maximum number of threats to return (capped at 1000).
+            limit:      Total maximum threats to return across all pages.
 
         Returns:
             List of raw threat dicts as returned by the API.
@@ -107,42 +107,61 @@ class SentinelOneIngestion(SIEMIngestionService):
             )
             return []
 
-        params: Dict[str, Any] = {
-            "limit": min(limit, 1000),
+        base_url = f"{url}/web/api/v2.1/threats"
+        # SentinelOne API max per page is 1000; we page until we have `limit` total.
+        per_page = min(limit, 1000)
+
+        base_params: Dict[str, Any] = {
             "sortBy": "createdAt",
             "sortOrder": "asc",
         }
         if start_time:
-            params["createdAt__gte"] = start_time.strftime(
+            base_params["createdAt__gte"] = start_time.strftime(
                 "%Y-%m-%dT%H:%M:%S.000000Z"
             )
         if end_time:
-            params["createdAt__lte"] = end_time.strftime(
+            base_params["createdAt__lte"] = end_time.strftime(
                 "%Y-%m-%dT%H:%M:%S.000000Z"
             )
 
+        all_threats: List[Dict[str, Any]] = []
+        next_cursor: Optional[str] = None
+        page = 0
+
         try:
-            url = f"{url}/web/api/v2.1/threats"
-            resp = await asyncio.to_thread(
-                requests.get,
-                url,
-                headers=self._headers(),
-                params=params,
-                timeout=30,
-            )
-            resp.raise_for_status()
-            body = resp.json()
-            threats = body.get("data", [])
-            if not threats:
-                logger.debug(
-                    "SentinelOne returned 0 threats. pagination=%s",
-                    body.get("pagination"),
+            while len(all_threats) < limit:
+                params = dict(base_params)
+                params["limit"] = min(per_page, limit - len(all_threats))
+                if next_cursor:
+                    params["cursor"] = next_cursor
+
+                resp = await asyncio.to_thread(
+                    requests.get,
+                    base_url,
+                    headers=self._headers(),
+                    params=params,
+                    timeout=30,
                 )
-            logger.info("Fetched %d threats from SentinelOne", len(threats))
-            return threats
+                resp.raise_for_status()
+                body = resp.json()
+                page_threats = body.get("data", [])
+                pagination = body.get("pagination", {})
+                all_threats.extend(page_threats)
+                page += 1
+
+                next_cursor = pagination.get("nextCursor")
+                if not next_cursor or not page_threats:
+                    break
+
+            logger.info(
+                "Fetched %d threats from SentinelOne (%d page(s))",
+                len(all_threats),
+                page,
+            )
+            return all_threats
         except Exception as e:
             logger.error("SentinelOne fetch_alerts failed: %s", e)
-            return []
+            return all_threats  # return whatever we got before the error
 
     def transform_alert_to_finding(
         self, threat: Dict[str, Any]
@@ -221,6 +240,7 @@ class SentinelOneIngestion(SIEMIngestionService):
         )
 
         # File hashes — field names differ between API versions
+        sha1 = threat_info.get("sha1") or threat.get("sha1") or ""
         md5 = (
             threat_info.get("md5")
             or threat_info.get("fileMd5")
@@ -233,7 +253,57 @@ class SentinelOneIngestion(SIEMIngestionService):
             or threat.get("sha256")
             or ""
         )
-        file_hashes = [h for h in [md5, sha256] if h]
+        file_hashes = [h for h in [sha1, md5, sha256] if h]
+
+        # File / process details
+        file_path = threat_info.get("filePath") or threat.get("filePath") or ""
+        file_name = (
+            threat_info.get("fileDisplayName")
+            or threat_info.get("threatName")
+            or threat.get("fileDisplayName")
+            or ""
+        )
+        process_args = (
+            threat_info.get("maliciousProcessArguments")
+            or threat.get("maliciousProcessArguments")
+            or ""
+        )
+        publisher = (
+            threat_info.get("publisherName") or threat.get("publisherName") or ""
+        )
+        initiated_by = (
+            threat_info.get("initiatedBy") or threat.get("initiatedBy") or ""
+        )
+        detection_type = (
+            threat_info.get("detectionType") or threat.get("detectionType") or ""
+        )
+        os_type = agent_info.get("osType") or threat.get("osType") or ""
+        os_version = agent_info.get("osRevision") or threat.get("osRevision") or ""
+
+        # Risk score: use SentinelOne's own score when available (0–10 scale → 0.0–1.0),
+        # fall back to confidence-based estimate.
+        raw_score = threat_info.get("riskScore") or threat.get("riskScore")
+        if raw_score is not None:
+            try:
+                anomaly_score = float(raw_score) / 10.0
+            except (TypeError, ValueError):
+                anomaly_score = 0.8 if confidence == "malicious" else 0.4
+        else:
+            anomaly_score = 0.8 if confidence == "malicious" else 0.4
+
+        # MITRE ATT&CK — extract from indicators array (v2.1 field)
+        mitre_predictions: Dict[str, Any] = {}
+        indicators = threat.get("indicators") or []
+        for ind in indicators:
+            technique = ind.get("mitreTechnique") or ind.get("mitreId") or ""
+            tactic = ind.get("mitreTactic") or ind.get("category") or ""
+            desc = ind.get("description") or ind.get("categoryName") or ""
+            if technique:
+                mitre_predictions[technique] = {
+                    "tactic": tactic,
+                    "description": desc,
+                    "confidence": 1.0,
+                }
 
         entity_context: Dict[str, Any] = {
             "src_ips": [ip] if ip else [],
@@ -241,12 +311,33 @@ class SentinelOneIngestion(SIEMIngestionService):
             "hostnames": [hostname] if hostname else [],
             "usernames": [username] if username else [],
             "file_hashes": file_hashes,
+            "file_path": file_path,
+            "file_name": file_name,
+            "process_args": process_args,
         }
 
-        description = (
-            f"{classification} detected on {hostname}: {threat_name}"
-            f" (confidence: {confidence}, mitigation: {mit_str or 'unknown'})"
-        ).strip(": ")
+        # Build a rich description
+        desc_parts = []
+        if classification:
+            desc_parts.append(f"Classification: {classification}")
+        if detection_type:
+            desc_parts.append(f"Detection type: {detection_type}")
+        if hostname:
+            desc_parts.append(f"Host: {hostname}")
+        if os_type:
+            desc_parts.append(f"OS: {os_type} {os_version}".strip())
+        if username:
+            desc_parts.append(f"User: {username}")
+        if file_path or file_name:
+            desc_parts.append(f"File: {file_path or file_name}")
+        if process_args:
+            desc_parts.append(f"Args: {process_args[:200]}")
+        if initiated_by:
+            desc_parts.append(f"Initiated by: {initiated_by}")
+        if publisher:
+            desc_parts.append(f"Publisher: {publisher}")
+        desc_parts.append(f"Confidence: {confidence}, Mitigation: {mit_str or 'unknown'}")
+        description = " | ".join(desc_parts)
 
         return {
             "finding_id": finding_id,
@@ -256,19 +347,32 @@ class SentinelOneIngestion(SIEMIngestionService):
             "severity": severity,
             "status": "new",
             "title": threat_name or classification or "SentinelOne Threat",
-            "description": description[:500],
+            "description": description[:1000],
             "entity_context": entity_context,
             "raw_event": threat,
-            "anomaly_score": 0.8 if confidence == "malicious" else 0.4,
-            "mitre_predictions": {},
+            "anomaly_score": round(anomaly_score, 2),
+            "mitre_predictions": mitre_predictions,
             "embedding": [],
             "metadata": {
                 "s1_threat_id": external_id,
                 "classification": classification,
                 "confidence_level": confidence,
                 "mitigation_status": mit_str,
+                "detection_type": detection_type,
+                "initiated_by": initiated_by,
+                "publisher": publisher,
+                "os_type": os_type,
+                "os_version": os_version,
+                "is_fileless": threat_info.get("isFileless") or False,
+                "reboot_required": threat_info.get("rebootRequired") or False,
                 "agent_id": (
                     agent_info.get("agentId") or threat.get("agentId") or ""
+                ),
+                "agent_version": (
+                    agent_info.get("agentVersion") or threat.get("agentVersion") or ""
+                ),
+                "storyline_id": (
+                    threat.get("storylineId") or threat_info.get("storylineId") or ""
                 ),
             },
         }

@@ -132,7 +132,7 @@ class FederationRunner:
                     {
                         "enabled": False,
                         "interval_seconds": adapter.default_interval(),
-                        "max_items": 100,
+                        "max_items": 1000,
                         "min_severity": None,
                         "cursor": {},
                         "consecutive_errors": 0,

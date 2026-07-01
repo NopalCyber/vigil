@@ -59,8 +59,8 @@ class SentinelOneAdapter:
 
         cutoff = parse_cursor_since(cursor) or since
         if cutoff is None:
-            # First run — fetch last 7 days for initial backfill
-            cutoff = datetime.utcnow() - timedelta(days=7)
+            # First run — fetch last 30 days for initial backfill
+            cutoff = datetime.utcnow() - timedelta(days=30)
 
         logger.debug("SentinelOne fetch: cursor=%s cutoff=%s", cursor, cutoff)
         try:
