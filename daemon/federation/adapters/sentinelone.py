@@ -78,9 +78,8 @@ class SentinelOneAdapter:
             # Track the latest threat timestamp to use as the next cursor so
             # partial fetches (max_items < total threats in window) continue
             # from where they left off rather than jumping to "now".
-            ts = (
-                threat.get("threatInfo", {}).get("createdAt")
-                or threat.get("createdAt")
+            ts = (threat.get("threatInfo") or {}).get("createdAt") or threat.get(
+                "createdAt"
             )
             if ts:
                 last_created_at = ts
@@ -93,14 +92,19 @@ class SentinelOneAdapter:
             # the last ingested event while still catching anything that arrived
             # in the same second (sub-second arrivals are rare in practice and
             # would be caught by the Redis dedup set anyway).
-            ts_clean = last_created_at.rstrip("Z")
             try:
                 ts_clean = (
-                    datetime.fromisoformat(ts_clean) + timedelta(seconds=1)
+                    datetime.fromisoformat(last_created_at.rstrip("Z"))
+                    + timedelta(seconds=1)
                 ).isoformat()
+                new_cursor: Dict[str, Any] = {"last_poll_at": ts_clean}
             except Exception:
-                pass
-            new_cursor: Dict[str, Any] = {"last_poll_at": ts_clean}
+                # Unparseable timestamp — storing the raw string would just
+                # fail identically on the next poll's parse_cursor_since(),
+                # permanently wedging into the fresh_cursor() 30-day-backfill
+                # fallback. Fall back to fresh_cursor() now instead so at
+                # least the cursor stays well-formed going forward.
+                new_cursor = fresh_cursor()
         elif threats:
             # Threats returned but no parseable timestamp — fall back to now.
             new_cursor = fresh_cursor()
