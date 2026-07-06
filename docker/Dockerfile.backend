@@ -59,10 +59,13 @@ ARG VIGIL_VERSION=dev
 LABEL org.opencontainers.image.version="${VIGIL_VERSION}"
 
 # Runtime system deps only
+# Node.js is required for npx-based MCP servers (e.g. virustotal, shodan, github)
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libpq5 \
       curl \
       git \
+      nodejs \
+      npm \
     && rm -rf /var/lib/apt/lists/*
 
 # uv/uvx — needed to spawn purple-mcp (SentinelOne MCP server) and other uvx-based servers
@@ -72,6 +75,17 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 RUN groupadd -r vigil && useradd -r -g vigil -d /app -s /sbin/nologin vigil
 
 WORKDIR /app
+
+# Make /app (== HOME for the vigil user) writable by vigil at the directory
+# level, not just specific subpaths. npx/uvx-spawned MCP servers create
+# their own cache/config dirs under $HOME on demand (e.g. $HOME/.cache/<pkg>,
+# $HOME/.npm, $HOME/.local/...) — new integrations add new tools with new
+# cache dir names over time, and enumerating each one here as it's
+# discovered is a losing game (see security-detections-mcp's
+# $HOME/.cache/security-detections-mcp EACCES failure). Owning the
+# directory itself means any subdir a vigil-run process creates inherits
+# writable ownership automatically, with no further Dockerfile changes.
+RUN chown vigil:vigil /app
 
 # Installed Python packages from the deps stage
 COPY --from=python-deps /install/deps /usr/local
@@ -95,13 +109,22 @@ COPY --chown=vigil:vigil setup.cfg    ./setup.cfg
 # Built SPA — served by FastAPI StaticFiles (or nginx sidecar)
 COPY --from=frontend-builder --chown=vigil:vigil /build/frontend/build ./frontend/build/
 
-# Writable dirs the app needs at runtime
+# Writable dirs the app needs at runtime. These are pre-created (rather than
+# left for on-demand creation) because they back named volumes that must
+# exist with correct ownership before Docker mounts them — everything else
+# any process creates under /app at runtime is already covered by the
+# `chown vigil:vigil /app` above.
+# /app/.npm_cache — npm cache for npx-based MCP servers (virustotal, shodan, etc.)
+#   kept in /app (not /tmp) so it survives container restarts on named volumes
 RUN mkdir -p /app/data/investigations \
              /app/data/mempalace \
              /app/logs \
              /app/.vigil \
              /app/.deeptempo \
-    && chown -R vigil:vigil /app/data /app/logs /app/.vigil /app/.deeptempo
+             /app/.npm_cache \
+    && echo 'cache=/app/.npm_cache' > /app/.npmrc \
+    && chown -R vigil:vigil /app/data /app/logs /app/.vigil /app/.deeptempo \
+                            /app/.npmrc /app/.npm_cache
 
 # Bake version into the image so `backend.__version__` resolves at import time
 # (backend/__init__.py reads VERSION from disk)

@@ -93,9 +93,15 @@ function fmt(iso: string | undefined, pattern: string): string {
 /* ---------------- cases ---------------- */
 
 function caseStatus(s?: string): CaseRow['status'] {
-  if (s === 'investigating') return 'investigating'
-  if (s === 'open') return 'open'
-  return 'closed' // resolved / closed / anything else
+  const v = (s || '').toLowerCase()
+  if (v === 'closed' || v === 'resolved') return 'closed'
+  if (v === 'investigating' || v === 'in_progress') return 'investigating'
+  // 'new' is the backend's default status for a freshly created case
+  // (see create_case in mcp-servers/servers/deeptempo_findings.py) — it
+  // was falling into the same bucket as 'closed' below, so every case
+  // showed up Closed the moment it was created. Unrecognized statuses
+  // should read as still-open (needs attention), not closed.
+  return 'open' // new / open / assigned / anything else unrecognized
 }
 
 function casePrio(p?: string): CaseRow['prio'] {

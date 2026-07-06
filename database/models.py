@@ -28,6 +28,26 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 import uuid
 
 
+def _isoformat_utc(dt: Optional[datetime]) -> Optional[str]:
+    """ISO-8601 string with an explicit UTC offset.
+
+    ``timestamp``/``created_at``/``updated_at`` columns are plain
+    ``DateTime`` (Postgres ``TIMESTAMP WITHOUT TIME ZONE``), so values
+    read back are tz-naive even though every writer in this codebase
+    populates them with UTC. A naive ``.isoformat()`` string (no ``Z``/
+    offset) gets handed to downstream tools as-is — e.g. SentinelOne's
+    ``sentinelone_powerquery`` MCP tool rejects it outright with
+    "Timestamp must include explicit timezone information". Since the
+    column is naive-but-UTC by convention, append ``Z`` rather than
+    reinterpreting it in another zone.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.isoformat() + "Z"
+    return dt.isoformat()
+
+
 class Base(DeclarativeBase):
     """Base class for all database models."""
 
@@ -143,15 +163,15 @@ class Finding(Base):
             "anomaly_score": self.anomaly_score,
             "entity_context": self.entity_context,
             "evidence_links": self.evidence_links,
-            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+            "timestamp": _isoformat_utc(self.timestamp),
             "data_source": self.data_source,
             "external_id": self.external_id,
             "cluster_id": self.cluster_id,
             "severity": self.severity,
             "status": self.status,
             "ai_enrichment": self.ai_enrichment,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "created_at": _isoformat_utc(self.created_at),
+            "updated_at": _isoformat_utc(self.updated_at),
         }
 
 

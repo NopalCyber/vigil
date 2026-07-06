@@ -18,7 +18,7 @@ import type { ScreenProps } from '../../shared/types'
 
 type WfTab = 'workflows' | 'agents' | 'skills'
 
-export default function WorkflowsScreen({ openChat }: ScreenProps) {
+export default function WorkflowsScreen(_props: ScreenProps) {
   const [tab, setTab] = useState<WfTab>('workflows')
   const tabs: [WfTab, string][] = [
     ['workflows', 'Workflows'],
@@ -42,7 +42,7 @@ export default function WorkflowsScreen({ openChat }: ScreenProps) {
           ))}
         </div>
       </div>
-      {tab === 'workflows' && <WorkflowCatalog openChat={openChat} />}
+      {tab === 'workflows' && <WorkflowCatalog />}
       {tab === 'agents' && <AgentsTab />}
       {tab === 'skills' && <SkillsTab />}
     </>
@@ -83,7 +83,7 @@ function AgentSequence({ agents }: { agents: string[] }) {
 /* ---------------- Workflows catalog ---------------- */
 type WfModal = { kind: 'run' | 'history' | 'edit' | 'delete' | 'details'; wf: Workflow }
 
-function WorkflowCatalog({ openChat }: { openChat: (prompt?: string) => void }) {
+function WorkflowCatalog() {
   const { rows, phase, error, reload } = useWorkflows()
   const [q, setQ] = useState('')
   const [modal, setModal] = useState<WfModal | null>(null)
@@ -153,7 +153,7 @@ function WorkflowCatalog({ openChat }: { openChat: (prompt?: string) => void }) 
         </div>
       )}
       {modal?.kind === 'details' && <DetailsModal wf={modal.wf} onClose={close} />}
-      {modal?.kind === 'run' && <RunModal wf={modal.wf} openChat={openChat} onClose={close} />}
+      {modal?.kind === 'run' && <RunModal wf={modal.wf} onClose={close} />}
       {modal?.kind === 'history' && <HistoryModal wf={modal.wf} onClose={close} />}
       {modal?.kind === 'edit' && <EditModal wf={modal.wf} onClose={close} onSaved={() => { close(); reload() }} />}
       {modal?.kind === 'delete' && <DeleteModal wf={modal.wf} onClose={close} onDeleted={() => { close(); reload() }} />}
@@ -323,22 +323,20 @@ function DetailsModal({ wf, onClose }: { wf: Workflow; onClose: () => void }) {
   )
 }
 
-/** Compose the chat prompt that runs a workflow (mirrors the old app's
-    buildSkillPrompt — the run happens as a streamed chat conversation). */
-function buildRunPrompt(wf: Workflow, p: { finding_id?: string; case_id?: string; context?: string; hypothesis?: string }): string {
-  const seq = wf.agents.map((a) => AGENT_META[a]?.label || prettyHandle(a)).join(' → ')
-  let prompt = `Please execute the **${wf.name}** workflow.\n\n`
-  if (seq) prompt += `**Agent sequence:** ${seq}\n\n`
-  if (p.finding_id) prompt += `**Target Finding:** ${p.finding_id}\n`
-  if (p.case_id) prompt += `**Target Case:** ${p.case_id}\n`
-  if (p.hypothesis) prompt += `**Hunt Hypothesis:** ${p.hypothesis}\n`
-  if (p.context) prompt += `**Context:** ${p.context}\n`
-  return prompt.trim()
+interface WfExecuteResult {
+  success: boolean
+  status: string
+  run_id?: string
+  result?: string
+  error?: string | null
 }
 
-/** Run a workflow — collects a target, then sends it to the Vigil chat where
-    the response streams (matching the old app's "launch in chat" behavior). */
-function RunModal({ wf, openChat, onClose }: { wf: Workflow; openChat: (prompt?: string) => void; onClose: () => void }) {
+/** Run a workflow — collects a target, then executes it directly via
+    POST /workflows/{id}/execute (the same engine that walks the workflow's
+    actual phase-by-phase instructions and required tools). Runs in-modal
+    with a busy state since a full multi-phase workflow can take a minute
+    or more; the result renders in place when it completes. */
+function RunModal({ wf, onClose }: { wf: Workflow; onClose: () => void }) {
   const [findingId, setFindingId] = useState('')
   const [caseId, setCaseId] = useState('')
   const [context, setContext] = useState('')
@@ -346,6 +344,9 @@ function RunModal({ wf, openChat, onClose }: { wf: Workflow; openChat: (prompt?:
   // Suggestions for the ID fields, fetched from the live findings/cases lists.
   const [findingOpts, setFindingOpts] = useState<{ id: string; label: string }[]>([])
   const [caseOpts, setCaseOpts] = useState<{ id: string; label: string }[]>([])
+  const [phase, setPhase] = useState<'form' | 'running' | 'done' | 'error'>('form')
+  const [outcome, setOutcome] = useState<WfExecuteResult | null>(null)
+  const [runErr, setRunErr] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -371,24 +372,74 @@ function RunModal({ wf, openChat, onClose }: { wf: Workflow; openChat: (prompt?:
   const canRun = Object.keys(params).length > 0
 
   const run = () => {
-    openChat(buildRunPrompt(wf, params))
-    onClose()
+    setPhase('running')
+    setRunErr(null)
+    workflowApi
+      .execute(wf.id, params)
+      .then((res) => {
+        setOutcome(res.data as WfExecuteResult)
+        setPhase('done')
+      })
+      .catch((e) => {
+        setRunErr(errMsg(e))
+        setPhase('error')
+      })
   }
 
   return (
     <Popup open onClose={onClose} title={`Run · ${wf.name}`}>
       <div className="flex flex-col gap-3.5">
-        <p className="text-[12.5px] text-tx-3 leading-[1.5]">Provide at least one target, then run it in the Vigil chat — the agents stream their work there. Findings and cases drive the investigation; context and hypothesis steer hunts.</p>
-        <ComboField label="Finding ID" value={findingId} onChange={setFindingId} placeholder="f-20260614-3b5c585e" options={findingOpts} hint={findingOpts.length ? `${findingOpts.length} recent findings — start typing to filter.` : undefined} />
-        <ComboField label="Case ID" value={caseId} onChange={setCaseId} placeholder="case-2026-0142" options={caseOpts} />
-        <Field label="Context" value={context} onChange={setContext} placeholder="Active ransomware on HOST-42…" textarea />
-        <Field label="Hypothesis" value={hypothesis} onChange={setHypothesis} placeholder="Lateral movement in the finance subnet…" textarea />
-        <div className="flex justify-end gap-2.5 pt-1">
-          <button className="btn ghost" onClick={onClose}>Cancel</button>
-          <button className="btn primary" disabled={!canRun} style={{ opacity: canRun ? 1 : 0.5 }} onClick={run}>
-            <Icon name="send" /> Run in chat
-          </button>
-        </div>
+        {phase === 'form' && (
+          <>
+            <p className="text-[12.5px] text-tx-3 leading-[1.5]">Provide at least one target, then run the workflow directly — it executes each phase against the live tools and posts the result here. Findings and cases drive the investigation; context and hypothesis steer hunts.</p>
+            <ComboField label="Finding ID" value={findingId} onChange={setFindingId} placeholder="f-20260614-3b5c585e" options={findingOpts} hint={findingOpts.length ? `${findingOpts.length} recent findings — start typing to filter.` : undefined} />
+            <ComboField label="Case ID" value={caseId} onChange={setCaseId} placeholder="case-2026-0142" options={caseOpts} />
+            <Field label="Context" value={context} onChange={setContext} placeholder="Active ransomware on HOST-42…" textarea />
+            <Field label="Hypothesis" value={hypothesis} onChange={setHypothesis} placeholder="Lateral movement in the finance subnet…" textarea />
+            <div className="flex justify-end gap-2.5 pt-1">
+              <button className="btn ghost" onClick={onClose}>Cancel</button>
+              <button className="btn primary" disabled={!canRun} style={{ opacity: canRun ? 1 : 0.5 }} onClick={run}>
+                <Icon name="play" /> Run workflow
+              </button>
+            </div>
+          </>
+        )}
+
+        {phase === 'running' && (
+          <div className="muted" style={{ padding: '32px 0', textAlign: 'center' }}>
+            Running {wf.name}… this executes every phase against live tools and can take a minute or more. Leave this open.
+          </div>
+        )}
+
+        {phase === 'error' && (
+          <>
+            <div className="text-[12.5px]" style={{ color: 'var(--crit)' }}>Couldn’t run the workflow: {runErr}</div>
+            <div className="flex justify-end gap-2.5 pt-1">
+              <button className="btn ghost" onClick={onClose}>Close</button>
+              <button className="btn primary" onClick={() => setPhase('form')}>Try again</button>
+            </div>
+          </>
+        )}
+
+        {phase === 'done' && outcome && (
+          <>
+            <div className="flex items-center gap-2">
+              <span className="status" style={{ background: 'transparent', color: runStatusColor(outcome.status), border: `1px solid ${runStatusColor(outcome.status)}55` }}>{outcome.status}</span>
+              {outcome.run_id && <span className="mono text-[11.5px] text-tx-3">{outcome.run_id}</span>}
+            </div>
+            {outcome.error && (
+              <div className="text-[12.5px]" style={{ color: 'var(--crit)' }}>{outcome.error}</div>
+            )}
+            {outcome.result && (
+              <div className="text-[13px] text-tx-2 leading-[1.6] [&_h1]:text-[15px] [&_h1]:font-semibold [&_h2]:text-[13.5px] [&_h2]:font-semibold [&_h3]:text-[13px] [&_h3]:font-semibold" style={{ maxHeight: '55vh', overflow: 'auto' }}>
+                <Markdown>{outcome.result}</Markdown>
+              </div>
+            )}
+            <div className="flex justify-end gap-2.5 pt-1">
+              <button className="btn ghost" onClick={onClose}>Close</button>
+            </div>
+          </>
+        )}
       </div>
     </Popup>
   )

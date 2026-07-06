@@ -138,12 +138,23 @@ if PROMETHEUS_AVAILABLE:
 try:
     from core.telemetry import init_telemetry
 
-    init_telemetry("vigil-backend")
+    _otel_enabled = init_telemetry("vigil-backend")
 except Exception as _tel_err:
+    _otel_enabled = False
     logging.basicConfig(level=logging.INFO)
     logging.getLogger(__name__).warning(
         "Telemetry init failed (non-fatal): %s", _tel_err
     )
+
+if not _otel_enabled:
+    # init_telemetry() returns False (no exception) whenever
+    # VIGIL_OTEL_ENABLED isn't set — the common case for this
+    # deployment. Root-logger setup normally happens inside
+    # core.telemetry._install_json_logging(), which only runs on the
+    # OTEL-enabled path, so without this the root logger is left at
+    # Python's default WARNING and every logger.info() call across
+    # backend/services/daemon is silently dropped.
+    logging.basicConfig(level=logging.INFO, force=True)
 
 logger = logging.getLogger(__name__)
 

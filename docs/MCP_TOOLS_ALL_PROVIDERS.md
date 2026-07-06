@@ -167,7 +167,7 @@ for _turn in range(6):
 | **Query / AI** | `sentinelone_powerquery`, `sentinelone_purple_ai` |
 | **Utilities** | `sentinelone_get_timestamp_range`, `sentinelone_iso_to_unix_timestamp` |
 
-### MCP Server Config (`mcp-servers/mcp_config.json`)
+### MCP Server Config (`mcp-config.json`, repo root)
 
 ```json
 "sentinelone": {
@@ -268,7 +268,7 @@ _filter_openai_tools(all_tools, server_map, allowed_tools)
 | `services/mcp_client.py` | Fix `PersistentServerSession` to use background asyncio task (anyio cancel scope fix); register tools in MCPRegistry on every `connect_to_server()` |
 | `services/bifrost_admin.py` | Fix `push_provider_key()` to use `/api/providers/{name}/keys` endpoint; add `_get_provider_keys()` helper |
 | `docker/docker-compose.yml` | Mount `../.vigil:/tmp/.vigil` so secrets store survives container rebuilds |
-| `mcp-servers/mcp_config.json` | Add SentinelOne/purple-mcp server entry |
+| `mcp-config.json` (repo root) | Add SentinelOne/purple-mcp server entry |
 
 ---
 

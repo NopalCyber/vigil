@@ -131,6 +131,7 @@ class PersistentServerSession:
                 raise RuntimeError(f"Failed to connect to {self.server_name}")
 
         try:
+            logger.debug("Calling %s.%s args=%r", self.server_name, tool_name, arguments)
             result = await self.session.call_tool(tool_name, arguments)
 
             content_list = []
@@ -526,6 +527,15 @@ class MCPClient:
 
         persistent_session = self.persistent_sessions[server_name]
 
+        # Plain INFO-level call/result pair — the OTEL span above needs a
+        # trace backend to view; this is what shows up in `docker logs`
+        # so a workflow run's tool calls are visible agent-by-agent
+        # without instrumentation.
+        _arg_preview = _json.dumps(arguments, default=str)
+        if len(_arg_preview) > 200:
+            _arg_preview = _arg_preview[:200] + "..."
+        logger.info(f"[mcp] -> {server_name}.{tool_name}({_arg_preview})")
+
         async def _call_tool_persistent():
             try:
                 return await persistent_session.call_tool(tool_name, arguments)
@@ -536,12 +546,17 @@ class MCPClient:
         try:
             # Apply timeout
             result = await asyncio.wait_for(_call_tool_persistent(), timeout=timeout)
+            _duration_ms = round((_time.monotonic() - _mcp_t0) * 1000, 1)
+            is_err = result.get("error", False) if isinstance(result, dict) else False
+            logger.info(
+                f"[mcp] <- {server_name}.{tool_name} "
+                f"{'ERROR' if is_err else 'ok'} in {_duration_ms}ms"
+            )
             try:
                 if _mcp_span is not None:
-                    is_err = result.get("error", False) if isinstance(result, dict) else False
                     _mcp_span.set_attribute("vigil.tool.success", not is_err)
                     _mcp_span.set_attribute("vigil.tool.output_size", len(_json.dumps(result, default=str)))
-                    _mcp_span.set_attribute("vigil.tool.duration_ms", round((_time.monotonic() - _mcp_t0) * 1000, 1))
+                    _mcp_span.set_attribute("vigil.tool.duration_ms", _duration_ms)
                     _mcp_span.end()
             except Exception:
                 pass

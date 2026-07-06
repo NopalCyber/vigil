@@ -455,6 +455,15 @@ def _install_json_logging() -> None:
     for handler in root.handlers[:]:
         root.removeHandler(handler)
 
+    # Root defaults to WARNING when no level has ever been set. This used
+    # to only get bumped to INFO by the logging.basicConfig() call in the
+    # init_telemetry() *failure* path in backend/main.py — so on every
+    # normal run (telemetry succeeds, which is the common case), every
+    # logger.info() call across backend/services/daemon was silently
+    # dropped despite the app being full of them. Set it here since this
+    # is the place that actually owns the root logger's handlers.
+    root.setLevel(logging.INFO)
+
     formatter = _OTELJsonFormatter()
 
     console = logging.StreamHandler()

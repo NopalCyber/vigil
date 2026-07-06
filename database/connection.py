@@ -6,10 +6,12 @@ Handles database connections, session management, and connection pooling.
 
 import os
 import logging
+import threading
 from typing import Optional, Generator, TYPE_CHECKING
 from urllib.parse import quote
 from contextlib import contextmanager
 from sqlalchemy import create_engine, event, pool, text
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.engine import Engine
 
@@ -265,14 +267,46 @@ class DatabaseManager:
             logger.error(f"Failed to initialize database: {e}")
             raise
 
+    # Postgres SQLSTATEs for "the object already exists" — the only outcomes
+    # of a concurrent create_all() race that are safe to swallow. Any other
+    # ProgrammingError (bad DDL, missing extension/type, undefined column,
+    # ...) must still propagate instead of being mistaken for the race.
+    _ALREADY_EXISTS_PGCODES = frozenset(
+        {
+            "23505",  # unique_violation (races on a pg_type/pg_class catalog row)
+            "42P07",  # duplicate_table
+            "42710",  # duplicate_object (e.g. duplicate index/constraint)
+        }
+    )
+
     def create_tables(self):
-        """Create all database tables."""
+        """Create all database tables.
+
+        Several processes (uvicorn workers, daemon components, persistent
+        MCP subprocesses) each call this independently at startup.
+        ``create_all()``'s built-in ``checkfirst`` only protects against a
+        table that already existed *before* this call started — two
+        processes can both see "missing" and race to issue CREATE TABLE,
+        which Postgres resolves by erroring one of them out (DuplicateTable
+        / a unique-violation on the pg_type catalog). That error means the
+        desired end state (tables exist) was reached by the other process,
+        so it's swallowed here rather than propagated.
+        """
         if self._engine is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
 
         try:
             Base.metadata.create_all(self._engine)
             logger.info("Database tables created successfully")
+        except (IntegrityError, ProgrammingError) as e:
+            pgcode = getattr(getattr(e, "orig", None), "pgcode", None)
+            if pgcode in self._ALREADY_EXISTS_PGCODES:
+                logger.info(
+                    "Database tables already created by a concurrent process: %s", e
+                )
+            else:
+                logger.error(f"Failed to create database tables: {e}")
+                raise
         except Exception as e:
             logger.error(f"Failed to create database tables: {e}")
             raise
@@ -361,21 +395,50 @@ class DatabaseManager:
         return self._engine
 
 
-# Global database manager instance
-_db_manager: Optional[DatabaseManager] = None
+_db_manager_init_lock = threading.Lock()
 
 
 def get_db_manager() -> DatabaseManager:
     """
-    Get the global database manager instance.
+    Get the global database manager instance, initializing the engine on
+    first use.
+
+    Each process (uvicorn workers, daemon components, persistent MCP
+    subprocesses) lazily touches this on first import. Only some callers
+    used to trigger ``.initialize()`` as a side effect (e.g.
+    ``DatabaseDataService``'s constructor) — a cold process whose very
+    first DB touch went through a caller that didn't (case-management
+    tools in the ``deeptempo-findings`` MCP subprocess, which go through
+    ``DatabaseService`` instead) hit "Database not initialized" on that
+    first call. Initializing here instead means every caller gets a
+    working manager regardless of call order.
+
+    Deliberately does NOT also call ``.create_tables()`` — by the time any
+    caller needs a session, the schema already exists (created once, at
+    real app startup, via ``init_database()``). Coupling table creation
+    into this getter meant a single persistent (non-race) ``create_all()``
+    failure would leave the engine live but never get cached, so every
+    future call re-took the lock and re-ran a failing DDL sweep forever.
+    Checking ``DatabaseManager``'s own ``_engine`` (rather than a second,
+    parallel "is it ready" flag) means a failed ``.initialize()`` is
+    naturally retried on the next call instead of wedging state that has
+    to be kept in sync by hand.
+
+    Note: this always initializes with the default ``echo=False``. If you
+    need SQL echo logging, call ``init_database(echo=True)`` yourself
+    before anything else in the process touches the database — once any
+    caller (including this one) reaches here first, ``.initialize()``'s
+    own idempotency guard means a later ``echo=True`` request no-ops.
 
     Returns:
         DatabaseManager instance
     """
-    global _db_manager
-    if _db_manager is None:
-        _db_manager = DatabaseManager()
-    return _db_manager
+    manager = DatabaseManager()
+    if manager._engine is None:
+        with _db_manager_init_lock:
+            if manager._engine is None:
+                manager.initialize()
+    return manager
 
 
 def get_db_session() -> Session:

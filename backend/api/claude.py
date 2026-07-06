@@ -631,6 +631,33 @@ async def chat(request: ChatRequest):
                     })
             else:
                 response = _result.get("content", "")
+                if not response:
+                    # Loop exhausted all 6 rounds still calling tools — the
+                    # last dispatch had no room to also write prose. Force
+                    # one more call with tools disabled so the model must
+                    # answer instead of silently returning empty text.
+                    logger.info(
+                        f"🔁 [RequestID: {request_id}] Router loop exhausted 6 rounds "
+                        "still calling tools — forcing a final no-tools response"
+                    )
+                    _loop_msgs.append({
+                        "role": "user",
+                        "content": (
+                            "Based on all the tool results above, provide your "
+                            "complete final answer now — do not make any more "
+                            "tool calls."
+                        ),
+                    })
+                    _result = await LLMRouter().dispatch(
+                        provider=active_provider,
+                        messages=_loop_msgs,
+                        system_prompt=_effective_sys,
+                        model=request.model,
+                        max_tokens=max_tokens,
+                        tools=None,
+                        interaction_id=request_id,
+                    )
+                    response = _result.get("content", "")
         elif request.use_agent_sdk and claude_service.use_agent_sdk:
             # Extract text from current message for agent query
             if isinstance(current_message, list):
@@ -1034,6 +1061,32 @@ async def chat_stream(
                             })
                     else:
                         _final_text = _result.get("content", "")
+                        if not _final_text:
+                            # Same fix as the non-streaming chat path: force
+                            # one more no-tools call so 6 rounds of pure
+                            # tool-calling doesn't end in empty text.
+                            logger.info(
+                                f"🔁 [RequestID: {request_id}] Router stream loop exhausted "
+                                "6 rounds still calling tools — forcing a final no-tools response"
+                            )
+                            _loop_msgs.append({
+                                "role": "user",
+                                "content": (
+                                    "Based on all the tool results above, provide your "
+                                    "complete final answer now — do not make any more "
+                                    "tool calls."
+                                ),
+                            })
+                            _result = await LLMRouter().dispatch(
+                                provider=active_provider,
+                                messages=_loop_msgs,
+                                system_prompt=_effective_sys,
+                                model=request.model,
+                                max_tokens=max_tokens,
+                                tools=None,
+                                interaction_id=request_id,
+                            )
+                            _final_text = _result.get("content", "")
                     elapsed_time = time.time() - start_time
                     logger.info(
                         f"✅ [RequestID: {request_id}] Router agentic loop complete in {elapsed_time:.2f}s"

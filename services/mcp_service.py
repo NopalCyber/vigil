@@ -5,6 +5,7 @@ import platform
 import logging
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Optional, Dict, List
 from datetime import datetime
@@ -227,13 +228,17 @@ class MCPService:
         
         self.project_root = Path(project_root)
         self.venv_path = self.project_root / "venv"
-        
-        # Determine Python executable
+
+        # Determine Python executable. Prefer the project venv (local dev),
+        # but fall back to the interpreter currently running the backend —
+        # e.g. in Docker there is no venv/, just the container's system
+        # Python at /usr/local/bin/python3.
         if platform.system() == "Windows":
-            self.python_exe = self.venv_path / "Scripts" / "python.exe"
+            venv_python = self.venv_path / "Scripts" / "python.exe"
         else:
-            self.python_exe = self.venv_path / "bin" / "python"
-        
+            venv_python = self.venv_path / "bin" / "python"
+        self.python_exe = venv_python if venv_python.exists() else Path(sys.executable)
+
         # Load enabled state (servers default to disabled)
         self._enabled_servers: Dict[str, bool] = self._load_enabled_state()
         
@@ -315,7 +320,7 @@ class MCPService:
             # Settings UI that land in the encrypted store but are not yet
             # in os.environ (e.g. on first connect after a backend restart).
             try:
-                from secrets_manager import get_secret as _gs  # type: ignore
+                from backend.secrets_manager import get_secret as _gs  # type: ignore
                 secret_val = _gs(var_name)
                 if secret_val:
                     return secret_val
