@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 import time as _time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from datetime import datetime
 
@@ -38,23 +38,6 @@ def _get_model_context_window(provider_type: str, model_id: str) -> int:
     except Exception as exc:  # noqa: BLE001
         logger.debug("_get_model_context_window lookup failed: %s", exc)
         return 0
-
-
-def _mcp_result_text(result: Any) -> str:
-    """Extract plain text from an MCP call_tool result dict."""
-    if isinstance(result, str):
-        return result
-    content = result.get("content", [])
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = [
-            (item.get("text") or item.get("content", ""))
-            for item in content
-            if isinstance(item, dict)
-        ]
-        return "\n".join(p for p in parts if p) or str(result)
-    return str(result)
 
 
 def _get_working_provider_spec():
@@ -101,6 +84,7 @@ async def _router_agentic_chat(
     max_tokens: int = 8192,
     allowed_tools: Optional[List[str]] = None,
     nudge_until_complete: bool = False,
+    unfiltered_mcp_tools: Optional[Tuple[List[Dict], Dict]] = None,
 ) -> str:
     """Run an agentic LLM turn through LLMRouter (non-Anthropic provider path).
 
@@ -115,6 +99,16 @@ async def _router_agentic_chat(
     which looks identical to a real final answer. Leave it off for
     ``_execute_phased``, where each call is deliberately scoped to exactly
     one phase and stopping after that phase's text is the correct outcome.
+
+    ``unfiltered_mcp_tools``: an already-built ``(openai_tools,
+    tool_server_map)`` pair from ``_get_openai_mcp_tools()``, for callers
+    that invoke this repeatedly against the same MCP tool cache (e.g. one
+    call per phase in ``_execute_phased``) — the tools_cache doesn't change
+    mid-run, so rebuilding the full ~200-tool OpenAI schema list on every
+    phase is wasted work. Each call still applies its own ``allowed_tools``
+    filter on top, since that legitimately differs per phase. Left as
+    ``None`` (the default), this is built fresh, matching the single-call
+    ``_execute_oneshot`` usage.
     """
     from services.llm_router import LLMRouter
     from services.mcp_client import get_mcp_client
@@ -124,32 +118,37 @@ async def _router_agentic_chat(
     if provider is None:
         return ""
 
-    # Build OpenAI-format tool list from MCP cache.
-    mcp_client = get_mcp_client()
-    openai_tools: List[Dict] = []
-    tool_server_map: Dict[str, tuple] = {}
-    if mcp_client and getattr(mcp_client, "tools_cache", None):
-        for server_name, server_tools in mcp_client.tools_cache.items():
-            for tool in server_tools:
-                raw_name = tool["name"]
-                full_name = f"{server_name}_{raw_name}"[:64]
-                openai_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": full_name,
-                        "description": f"[{server_name}] {tool.get('description', '')}",
-                        "parameters": tool.get("inputSchema", {"type": "object", "properties": {}}),
-                    },
-                })
-                tool_server_map[full_name] = (server_name, raw_name)
+    # Build OpenAI-format tool list from MCP cache (unless the caller
+    # already built it once for this run). Reuses claude.py's builder since
+    # the transform itself (tools_cache -> OpenAI function schema) is
+    # identical between the chat agent and the workflow engine — nothing
+    # about it is workflow-specific.
+    from backend.api.claude import _get_openai_mcp_tools, _mcp_tool_result_text
 
-    # Filter to allowed tools (mirrors _filter_openai_tools in backend/api/claude.py).
+    mcp_client = get_mcp_client()
+    if unfiltered_mcp_tools is not None:
+        openai_tools, tool_server_map = unfiltered_mcp_tools
+    else:
+        openai_tools, tool_server_map = _get_openai_mcp_tools()
+
+    # Filter to allowed tools. Deliberately NOT reusing claude.py's
+    # _filter_openai_tools() here: that helper falls back to returning ALL
+    # tools when none of allowed_tools match (correct for the chat agent,
+    # where built-in agents list internal Vigil tool names that don't match
+    # any MCP name). A workflow's allowed_tools is a deliberate scope limit
+    # (see the ONESHOT context-window preflight below) -- silently falling
+    # back to the full ~200-tool registry here would reintroduce the exact
+    # context-overflow failure that preflight exists to catch.
     if allowed_tools and openai_tools:
         wanted = set(allowed_tools)
         filtered = [
-            t for t in openai_tools
+            t
+            for t in openai_tools
             if t["function"]["name"] in wanted
-            or ("_" in t["function"]["name"] and t["function"]["name"].split("_", 1)[1] in wanted)
+            or (
+                "_" in t["function"]["name"]
+                and t["function"]["name"].split("_", 1)[1] in wanted
+            )
         ]
         if filtered:
             openai_tools = filtered
@@ -167,13 +166,19 @@ async def _router_agentic_chat(
     # Char-heuristic estimate only (no network call) — good enough to
     # catch a model whose context window is clearly too small for a
     # tool-heavy workflow; not meant to be exact.
-    _context_window = _get_model_context_window(provider.provider_type, provider.default_model)
+    _context_window = _get_model_context_window(
+        provider.provider_type, provider.default_model
+    )
     if _context_window:
         from services.cost_estimator import _char_heuristic_tokens
 
-        _tools_chars = len(_json.dumps(openai_tools, default=str)) if openai_tools else 0
-        _est_input_tokens = _char_heuristic_tokens(message) + _char_heuristic_tokens(system_prompt) + (
-            _tools_chars // 4
+        _tools_chars = (
+            len(_json.dumps(openai_tools, default=str)) if openai_tools else 0
+        )
+        _est_input_tokens = (
+            _char_heuristic_tokens(message)
+            + _char_heuristic_tokens(system_prompt)
+            + (_tools_chars // 4)
         )
         _needed = _est_input_tokens + max_tokens
         if _needed > _context_window:
@@ -181,9 +186,14 @@ async def _router_agentic_chat(
                 "[workflow] %s/%s context window (%d tokens) is too small for this "
                 "request (~%d tokens estimated: %d prompt + %d for %d tool schemas + "
                 "%d max_tokens budget)",
-                provider.provider_type, provider.default_model, _context_window,
-                _needed, _est_input_tokens - (_tools_chars // 4), _tools_chars // 4,
-                len(openai_tools), max_tokens,
+                provider.provider_type,
+                provider.default_model,
+                _context_window,
+                _needed,
+                _est_input_tokens - (_tools_chars // 4),
+                _tools_chars // 4,
+                len(openai_tools),
+                max_tokens,
             )
             return (
                 f"Cannot run this workflow: the configured model "
@@ -234,71 +244,86 @@ async def _router_agentic_chat(
 
             nudges_used += 1
             messages.append({"role": "assistant", "content": content})
-            messages.append({
-                "role": "user",
-                "content": (
-                    "Continue. Have you fully completed every phase this task "
-                    "requires, including any final report and required tool "
-                    "calls (e.g. case creation)? If any phase or step remains, "
-                    "do it now -- call the next tool or write the next phase's "
-                    "content; do not just describe what you are about to do. "
-                    f"If it is genuinely complete, reply with exactly: "
-                    f"{_COMPLETE_SENTINEL}"
-                ),
-            })
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Continue. Have you fully completed every phase this task "
+                        "requires, including any final report and required tool "
+                        "calls (e.g. case creation)? If any phase or step remains, "
+                        "do it now -- call the next tool or write the next phase's "
+                        "content; do not just describe what you are about to do. "
+                        f"If it is genuinely complete, reply with exactly: "
+                        f"{_COMPLETE_SENTINEL}"
+                    ),
+                }
+            )
             continue
 
         # tool_calls are OpenAI SDK objects — access via attributes (tc.id, tc.function.name).
-        messages.append({
-            "role": "assistant",
-            "content": last_result.get("content") or None,
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                }
-                for tc in tool_calls
-            ],
-        })
+        messages.append(
+            {
+                "role": "assistant",
+                "content": last_result.get("content") or None,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            }
+        )
 
         # Execute each tool call and feed results back.
         for tc in tool_calls:
             fn_name = tc.function.name
             try:
-                args = _json.loads(tc.function.arguments or "{}") if isinstance(tc.function.arguments, str) else {}
+                args = (
+                    _json.loads(tc.function.arguments or "{}")
+                    if isinstance(tc.function.arguments, str)
+                    else {}
+                )
             except Exception:
                 args = {}
 
             server_name, raw_name = tool_server_map.get(fn_name, ("", fn_name))
             if mcp_client and server_name:
                 try:
-                    tool_result = await mcp_client.call_tool(server_name, raw_name, args)
-                    result_text = _mcp_result_text(tool_result)
+                    tool_result = await mcp_client.call_tool(
+                        server_name, raw_name, args
+                    )
+                    result_text = _mcp_tool_result_text(tool_result)
                 except Exception as _tc_err:
                     result_text = f"Tool error: {_tc_err}"
             else:
                 result_text = f"Tool '{fn_name}' not available"
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result_text,
-            })
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result_text,
+                }
+            )
 
     # Loop exhausted (or model returned empty text) — force a final text response
     # by sending one more call with tools=None so the model cannot make more tool calls.
-    logger.debug(
-        "_router_agentic_chat forcing final summary after %d turns", max_turns
+    logger.debug("_router_agentic_chat forcing final summary after %d turns", max_turns)
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Based on all the investigation work and tool results above, "
+                "provide your complete final analysis, findings, and recommendations. "
+                "Write your full response now — do not make any more tool calls."
+            ),
+        }
     )
-    messages.append({
-        "role": "user",
-        "content": (
-            "Based on all the investigation work and tool results above, "
-            "provide your complete final analysis, findings, and recommendations. "
-            "Write your full response now — do not make any more tool calls."
-        ),
-    })
     final_result = await router.dispatch(
         provider=provider,
         messages=messages,
@@ -943,7 +968,10 @@ For each phase:
         )
         use_claude = claude_service.has_api_key()
         if not use_claude and not _has_active_provider():
-            return {"success": False, "error": "No LLM provider configured. Add an API key in Settings → AI / LLM Providers."}
+            return {
+                "success": False,
+                "error": "No LLM provider configured. Add an API key in Settings → AI / LLM Providers.",
+            }
 
         workflow_dict = workflow.to_dict(include_body=False)
 
@@ -1006,8 +1034,12 @@ For each phase:
                     allowed_tools=mcp_allowed_tools if mcp_allowed_tools else None,
                     nudge_until_complete=True,
                 )
-            success = response_text is not None
-            error = None
+            # bool(), not "is not None": the router path returns "" (not
+            # None) when the model yields no final text, and that must be
+            # treated as a failed run, not a silently "completed" empty one
+            # -- matching the phased path's `phase_ok = bool(response_text)`.
+            success = bool(response_text)
+            error = None if success else "LLM returned no response"
         except Exception as exc:  # noqa: BLE001
             response_text = ""
             success = False
@@ -1053,10 +1085,16 @@ For each phase:
         from services.claude_service import ClaudeService
         from services.workflow_run_service import get_workflow_run_service
 
-        if not ClaudeService(
-            use_backend_tools=False, use_mcp_tools=False, use_agent_sdk=False
-        ).has_api_key() and not _has_active_provider():
-            return {"success": False, "error": "No LLM provider configured. Add an API key in Settings → AI / LLM Providers."}
+        if (
+            not ClaudeService(
+                use_backend_tools=False, use_mcp_tools=False, use_agent_sdk=False
+            ).has_api_key()
+            and not _has_active_provider()
+        ):
+            return {
+                "success": False,
+                "error": "No LLM provider configured. Add an API key in Settings → AI / LLM Providers.",
+            }
 
         _, skill_tool_names = self._collect_tools(workflow, {})
 
@@ -1126,6 +1164,18 @@ For each phase:
             enable_thinking=True,
         )
         _use_claude = claude_service.has_api_key()
+
+        # Built once per run (not per phase) and passed into every
+        # _router_agentic_chat call below -- the MCP tools_cache doesn't
+        # change mid-run, so re-walking it and rebuilding the ~200-tool
+        # OpenAI schema list on every phase was wasted work. Each phase
+        # still applies its own allowed_tools filter on top of this shared
+        # base list.
+        _unfiltered_mcp_tools: Optional[Tuple[List[Dict], Dict]] = None
+        if not _use_claude:
+            from backend.api.claude import _get_openai_mcp_tools
+
+            _unfiltered_mcp_tools = _get_openai_mcp_tools()
 
         phase_outputs: List[Dict[str, Any]] = []
         last_response_text = ""
@@ -1266,6 +1316,7 @@ For each phase:
                         system_prompt=system_prompt,
                         max_tokens=8192,
                         allowed_tools=phase_tools or None,
+                        unfiltered_mcp_tools=_unfiltered_mcp_tools,
                     )
                 phase_ok = bool(response_text)
                 phase_error = None if phase_ok else "LLM returned no response"
