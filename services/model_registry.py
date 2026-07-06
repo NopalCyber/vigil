@@ -61,11 +61,15 @@ def _record_pricing_unknown(provider_type: str, model_id: str) -> None:
             )
         _pricing_unknown_counter.add(
             1,
-            {"provider_type": provider_type or "unknown", "model_id": model_id or "unknown"},
+            {
+                "provider_type": provider_type or "unknown",
+                "model_id": model_id or "unknown",
+            },
         )
     except Exception:
         # Telemetry must never break cost math.
         pass
+
 
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO / "backend") not in sys.path:

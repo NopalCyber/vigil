@@ -260,6 +260,13 @@ class _StubRegistry(ModelRegistry):
     def _default_anthropic_provider(self):  # type: ignore[override]
         return self._default_anthropic
 
+    def _default_active_provider(self):  # type: ignore[override]
+        # resolve_model_for_component() now resolves through this method
+        # (any active/default provider, not specifically Anthropic) — the
+        # stub's canned "default_anthropic" fixture doubles as "the one
+        # configured provider" for these tests, so route both through it.
+        return self._default_anthropic
+
 
 def test_resolve_uses_explicit_component_assignment():
     reg = _StubRegistry(
