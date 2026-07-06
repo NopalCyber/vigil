@@ -12,12 +12,14 @@ import threading
 try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
+
     MCP_AVAILABLE = True
 except ImportError:
     try:
         # Try alternative import path
         from mcp.client import ClientSession
         from mcp.client.stdio import StdioServerParameters, stdio_client
+
         MCP_AVAILABLE = True
     except ImportError:
         MCP_AVAILABLE = False
@@ -57,6 +59,15 @@ class PersistentServerSession:
         self._bg_task: Optional[asyncio.Task] = None
         self._connected_event: Optional[asyncio.Event] = None
         self._connect_error: Optional[str] = None
+        # Serializes connect()/disconnect() so two concurrent callers can't
+        # both decide "not connected, reconnect" at once -- without this,
+        # the second caller cancels the first's in-flight _bg_task and
+        # replaces _connected_event out from under it, leaving the first
+        # caller awaiting an event that will never fire (it hangs the full
+        # 60s timeout and reports a spurious "Failed to connect"). Not held
+        # during the actual tool call in call_tool() so concurrent calls to
+        # an already-connected session aren't serialized.
+        self._lifecycle_lock = asyncio.Lock()
 
     async def _run_session(self) -> None:
         """Background task: owns the stdio_client/ClientSession lifecycle."""
@@ -68,7 +79,9 @@ class PersistentServerSession:
                     self.is_connected = True
                     if self._connected_event:
                         self._connected_event.set()
-                    logger.info("✓ Persistent connection established to %s", self.server_name)
+                    logger.info(
+                        "✓ Persistent connection established to %s", self.server_name
+                    )
                     # Hold the context open until this task is cancelled.
                     await asyncio.get_event_loop().create_future()
         except asyncio.CancelledError:
@@ -84,6 +97,11 @@ class PersistentServerSession:
 
     async def connect(self) -> bool:
         """Start the background task and wait up to 60 s for the connection."""
+        async with self._lifecycle_lock:
+            return await self._connect_locked()
+
+    async def _connect_locked(self) -> bool:
+        """connect()'s body -- caller must already hold self._lifecycle_lock."""
         if self.is_connected and self.session:
             return True
 
@@ -101,37 +119,53 @@ class PersistentServerSession:
         self._bg_task = loop.create_task(self._run_session())
 
         try:
-            await asyncio.wait_for(asyncio.shield(self._connected_event.wait()), timeout=60.0)
+            await asyncio.wait_for(
+                asyncio.shield(self._connected_event.wait()), timeout=60.0
+            )
         except asyncio.TimeoutError:
             logger.error("Timeout waiting for %s to connect", self.server_name)
             self._bg_task.cancel()
             return False
 
         if not self.is_connected:
-            logger.error("Connection to %s failed: %s", self.server_name, self._connect_error)
+            logger.error(
+                "Connection to %s failed: %s", self.server_name, self._connect_error
+            )
             return False
         return True
 
     async def disconnect(self) -> None:
         """Cancel the background task, which exits the anyio context managers cleanly."""
-        if self._bg_task and not self._bg_task.done():
-            self._bg_task.cancel()
-            try:
-                await self._bg_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        self.is_connected = False
-        self.session = None
+        async with self._lifecycle_lock:
+            if self._bg_task and not self._bg_task.done():
+                self._bg_task.cancel()
+                try:
+                    await self._bg_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self.is_connected = False
+            self.session = None
 
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def call_tool(
+        self, tool_name: str, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Call a tool using the persistent session."""
         if not self.is_connected or not self.session:
-            logger.warning("Session not connected for %s, attempting to reconnect...", self.server_name)
-            if not await self.connect():
-                raise RuntimeError(f"Failed to connect to {self.server_name}")
+            logger.warning(
+                "Session not connected for %s, attempting to reconnect...",
+                self.server_name,
+            )
+            async with self._lifecycle_lock:
+                # Re-check now that we hold the lock -- another caller may
+                # have already reconnected while we were waiting for it.
+                if not self.is_connected or not self.session:
+                    if not await self._connect_locked():
+                        raise RuntimeError(f"Failed to connect to {self.server_name}")
 
         try:
-            logger.debug("Calling %s.%s args=%r", self.server_name, tool_name, arguments)
+            logger.debug(
+                "Calling %s.%s args=%r", self.server_name, tool_name, arguments
+            )
             result = await self.session.call_tool(tool_name, arguments)
 
             content_list = []
@@ -139,7 +173,9 @@ class PersistentServerSession:
                 if hasattr(content_item, "text"):
                     content_list.append({"type": "text", "text": content_item.text})
                 elif hasattr(content_item, "type"):
-                    content_list.append({"type": str(content_item.type), "text": str(content_item)})
+                    content_list.append(
+                        {"type": str(content_item.type), "text": str(content_item)}
+                    )
                 else:
                     content_list.append({"type": "text", "text": str(content_item)})
 
@@ -149,14 +185,16 @@ class PersistentServerSession:
             }
 
         except Exception as exc:
-            logger.error("Tool call failed for %s.%s: %s", self.server_name, tool_name, exc)
+            logger.error(
+                "Tool call failed for %s.%s: %s", self.server_name, tool_name, exc
+            )
             self.is_connected = False
             raise
 
 
 class MCPClient:
     """Client for connecting to MCP servers and using their tools with persistent connections."""
-    
+
     def __init__(self, mcp_service: MCPService):
         """
         Initialize MCP client with persistent connection support.
@@ -167,13 +205,17 @@ class MCPClient:
         self.mcp_service = mcp_service
         self.persistent_sessions: Dict[str, PersistentServerSession] = {}
         self.tools_cache: Dict[str, List[Dict]] = {}
-        self._connection_locks: Dict[str, threading.Lock] = {}  # Locks per server to prevent concurrent connections
+        self._connection_locks: Dict[str, threading.Lock] = (
+            {}
+        )  # Locks per server to prevent concurrent connections
         # Populated by connect_to_server — string reason on failure, and a
         # structured list of env var names when credentials are missing.
         self.last_errors: Dict[str, str] = {}
         self.last_missing_credentials: Dict[str, List[str]] = {}
-    
-    async def connect_to_server(self, server_name: str, persistent: bool = True) -> bool:
+
+    async def connect_to_server(
+        self, server_name: str, persistent: bool = True
+    ) -> bool:
         """
         Connect to an MCP server, cache its tools, and optionally maintain persistent connection.
 
@@ -250,7 +292,10 @@ class MCPClient:
             if raw_env:
                 live_env = os.environ.copy()
                 live_env.update(
-                    {k: self.mcp_service._substitute_env_vars(v) for k, v in raw_env.items()}
+                    {
+                        k: self.mcp_service._substitute_env_vars(v)
+                        for k, v in raw_env.items()
+                    }
                 )
                 pythonpath = server.env.get("PYTHONPATH", "")
                 if pythonpath:
@@ -260,72 +305,83 @@ class MCPClient:
 
             # Create stdio server parameters
             server_params = StdioServerParameters(
-                command=server.command,
-                args=server.args,
-                env=live_env
+                command=server.command, args=server.args, env=live_env
             )
-            
+
             if persistent:
                 # Create persistent session
                 if server_name not in self.persistent_sessions:
                     self.persistent_sessions[server_name] = PersistentServerSession(
                         server_name, server_params
                     )
-                
+
                 # Connect
                 if not await self.persistent_sessions[server_name].connect():
                     return False
-                
+
                 # Get tools from the persistent session
                 session = self.persistent_sessions[server_name].session
                 tools_result = await session.list_tools()
-                
+
             else:
                 # Temporary connection just to get tools
                 async with stdio_client(server_params) as (read_stream, write_stream):
                     async with ClientSession(read_stream, write_stream) as session:
                         await session.initialize()
                         tools_result = await session.list_tools()
-            
+
             # Cache tools
             self.tools_cache[server_name] = []
             for tool in tools_result.tools:
                 # Get input schema - handle both dict and object formats
                 input_schema = tool.inputSchema
-                if hasattr(input_schema, 'model_dump'):
+                if hasattr(input_schema, "model_dump"):
                     input_schema = input_schema.model_dump()
-                elif hasattr(input_schema, 'dict'):
+                elif hasattr(input_schema, "dict"):
                     input_schema = input_schema.dict()
                 elif not isinstance(input_schema, dict):
                     input_schema = dict(input_schema) if input_schema else {}
-                
+
                 # Ensure it's a valid JSON schema
                 if not isinstance(input_schema, dict):
                     input_schema = {}
-                
-                self.tools_cache[server_name].append({
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "inputSchema": input_schema
-                })
-            
-            logger.info(f"Connected to {server_name}, found {len(self.tools_cache[server_name])} tools")
+
+                self.tools_cache[server_name].append(
+                    {
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "inputSchema": input_schema,
+                    }
+                )
+
+            logger.info(
+                f"Connected to {server_name}, found {len(self.tools_cache[server_name])} tools"
+            )
 
             # Register tools in the global MCP registry so the agent builder
             # UI and ClaudeService can discover them without a chat session first.
             try:
                 from services.mcp_registry import get_mcp_registry
+
                 registry = get_mcp_registry()
                 server = self.mcp_service.servers.get(server_name)
                 config = {}
                 if server:
-                    config = {"command": server.command, "args": server.args, "env": server.env}
-                registry.register_server(server_name, config, self.tools_cache[server_name])
+                    config = {
+                        "command": server.command,
+                        "args": server.args,
+                        "env": server.env,
+                    }
+                registry.register_server(
+                    server_name, config, self.tools_cache[server_name]
+                )
             except Exception as _reg_err:
-                logger.debug("Could not register %s tools in registry: %s", server_name, _reg_err)
+                logger.debug(
+                    "Could not register %s tools in registry: %s", server_name, _reg_err
+                )
 
             return True
-        
+
         except Exception as e:
             # Preserve the exception text so the UI can surface the real
             # reason (e.g. "FileNotFoundError: uvx", "ModuleNotFoundError:
@@ -420,9 +476,7 @@ class MCPClient:
                     server_name, persistent=True
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Dormant-retry for %s raised: %s", server_name, exc
-                )
+                logger.warning("Dormant-retry for %s raised: %s", server_name, exc)
                 attempted[server_name] = False
         if attempted:
             connected = sum(1 for v in attempted.values() if v)
@@ -433,21 +487,23 @@ class MCPClient:
             )
         return attempted
 
-    async def list_tools(self, server_name: Optional[str] = None) -> Dict[str, List[Dict]]:
+    async def list_tools(
+        self, server_name: Optional[str] = None
+    ) -> Dict[str, List[Dict]]:
         """
         List available tools from MCP servers.
-        
+
         Args:
             server_name: Optional server name to list tools from. If None, lists from all servers.
-            
+
         Returns:
             Dictionary mapping server names to lists of tool definitions
         """
         if not MCP_AVAILABLE:
             return {}
-        
+
         tools = {}
-        
+
         if server_name:
             if server_name in self.tools_cache:
                 tools[server_name] = self.tools_cache[server_name]
@@ -464,10 +520,16 @@ class MCPClient:
                     # Try to connect
                     if await self.connect_to_server(name):
                         tools[name] = self.tools_cache.get(name, [])
-        
+
         return tools
-    
-    async def call_tool(self, server_name: str, tool_name: str, arguments: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
+
+    async def call_tool(
+        self,
+        server_name: str,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        timeout: float = 30.0,
+    ) -> Dict[str, Any]:
         """
         Call a tool on an MCP server using persistent connection with timeout.
 
@@ -484,10 +546,21 @@ class MCPClient:
         import time as _time
 
         if not MCP_AVAILABLE:
-            return {"error": "MCP SDK not available", "content": [{"type": "text", "text": "MCP SDK not available"}]}
+            return {
+                "error": "MCP SDK not available",
+                "content": [{"type": "text", "text": "MCP SDK not available"}],
+            }
 
         if server_name not in self.mcp_service.servers:
-            return {"error": f"Unknown server: {server_name}", "content": [{"type": "text", "text": f"Unknown server: {server_name}"}]}
+            return {
+                "error": f"Unknown server: {server_name}",
+                "content": [{"type": "text", "text": f"Unknown server: {server_name}"}],
+            }
+
+        # Serialize arguments once and reuse for both the span attribute and
+        # the log preview below -- this used to json.dumps the same dict
+        # twice per call.
+        _args_json = _json.dumps(arguments, default=str)
 
         # OTEL span for transport-level MCP call
         _mcp_span = None
@@ -495,6 +568,7 @@ class MCPClient:
         try:
             from core.telemetry import get_tracer
             from opentelemetry.trace import SpanKind, StatusCode as _SC
+
             _mcp_tracer = get_tracer("vigil.services.mcp_client")
             _mcp_span = _mcp_tracer.start_span(
                 "mcp.call_tool",
@@ -503,9 +577,13 @@ class MCPClient:
                     "mcp.server.name": server_name,
                     "mcp.transport": "stdio",
                     "vigil.tool.name": tool_name,
-                    "vigil.tool.input_size": len(_json.dumps(arguments, default=str)),
                 },
             )
+            # is_recording() is False for the no-op span used whenever OTEL
+            # is disabled (the default) -- skip serializing input size for a
+            # span nothing will ever read.
+            if _mcp_span.is_recording():
+                _mcp_span.set_attribute("vigil.tool.input_size", len(_args_json))
         except Exception:
             _SC = None
 
@@ -515,7 +593,12 @@ class MCPClient:
             if not await self.connect_to_server(server_name, persistent=True):
                 _err = {
                     "error": True,
-                    "content": [{"type": "text", "text": f"Failed to connect to server: {server_name}"}]
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"Failed to connect to server: {server_name}",
+                        }
+                    ],
                 }
                 try:
                     if _mcp_span is not None:
@@ -531,7 +614,7 @@ class MCPClient:
         # trace backend to view; this is what shows up in `docker logs`
         # so a workflow run's tool calls are visible agent-by-agent
         # without instrumentation.
-        _arg_preview = _json.dumps(arguments, default=str)
+        _arg_preview = _args_json
         if len(_arg_preview) > 200:
             _arg_preview = _arg_preview[:200] + "..."
         logger.info(f"[mcp] -> {server_name}.{tool_name}({_arg_preview})")
@@ -555,14 +638,22 @@ class MCPClient:
             try:
                 if _mcp_span is not None:
                     _mcp_span.set_attribute("vigil.tool.success", not is_err)
-                    _mcp_span.set_attribute("vigil.tool.output_size", len(_json.dumps(result, default=str)))
                     _mcp_span.set_attribute("vigil.tool.duration_ms", _duration_ms)
+                    # Skip serializing the (potentially large) full result
+                    # just to measure its length when nothing will read it.
+                    if _mcp_span.is_recording():
+                        _mcp_span.set_attribute(
+                            "vigil.tool.output_size",
+                            len(_json.dumps(result, default=str)),
+                        )
                     _mcp_span.end()
             except Exception:
                 pass
             return result
         except asyncio.TimeoutError:
-            logger.error(f"Tool call {tool_name} on {server_name} timed out after {timeout}s")
+            logger.error(
+                f"Tool call {tool_name} on {server_name} timed out after {timeout}s"
+            )
             try:
                 if _mcp_span is not None and _SC is not None:
                     _mcp_span.set_attribute("vigil.tool.success", False)
@@ -572,7 +663,12 @@ class MCPClient:
                 pass
             return {
                 "error": True,
-                "content": [{"type": "text", "text": f"Tool call timed out after {timeout} seconds. The MCP server may not be responding."}]
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Tool call timed out after {timeout} seconds. The MCP server may not be responding.",
+                    }
+                ],
             }
         except Exception as e:
             logger.error(f"Error calling tool {tool_name} on {server_name}: {e}")
@@ -582,36 +678,39 @@ class MCPClient:
                     _mcp_span.end()
             except Exception:
                 pass
-            return {"error": True, "content": [{"type": "text", "text": f"Error: {str(e)}"}]}
-    
+            return {
+                "error": True,
+                "content": [{"type": "text", "text": f"Error: {str(e)}"}],
+            }
+
     def get_tools_for_claude(self) -> List[Dict]:
         """
         Get all available tools formatted for Claude's tool use API.
-        
+
         Returns:
             List of tool definitions in Claude's format
         """
         all_tools = []
-        
+
         for server_name, tools in self.tools_cache.items():
             for tool in tools:
                 # Format tool for Claude API
                 claude_tool = {
                     "name": f"{server_name}_{tool['name']}",
                     "description": f"[{server_name}] {tool['description']}",
-                    "input_schema": tool.get("inputSchema", {})
+                    "input_schema": tool.get("inputSchema", {}),
                 }
                 all_tools.append(claude_tool)
-        
+
         return all_tools
-    
+
     async def disconnect_from_server(self, server_name: str) -> bool:
         """
         Disconnect from a specific MCP server.
-        
+
         Args:
             server_name: Name of the server to disconnect from
-            
+
         Returns:
             True if successful, False otherwise
         """
@@ -625,27 +724,27 @@ class MCPClient:
                 logger.error(f"Error disconnecting from {server_name}: {e}")
                 return False
         return True
-    
+
     async def reconnect_to_server(self, server_name: str) -> bool:
         """
         Reconnect to a specific MCP server.
-        
+
         Args:
             server_name: Name of the server to reconnect to
-            
+
         Returns:
             True if successful, False otherwise
         """
         # Disconnect if already connected
         await self.disconnect_from_server(server_name)
-        
+
         # Reconnect
         return await self.connect_to_server(server_name, persistent=True)
-    
+
     def get_connection_status(self) -> Dict[str, bool]:
         """
         Get connection status for all servers.
-        
+
         Returns:
             Dictionary mapping server names to connection status
         """
@@ -656,11 +755,11 @@ class MCPClient:
             else:
                 status[server_name] = False
         return status
-    
+
     async def close_all(self):
         """Close all persistent MCP server connections and clear cache."""
         logger.info("Closing all MCP server connections...")
-        
+
         # Disconnect all persistent sessions sequentially to avoid context issues
         for server_name in list(self.persistent_sessions.keys()):
             try:
@@ -668,11 +767,11 @@ class MCPClient:
                 logger.info(f"Disconnected from {server_name}")
             except Exception as e:
                 logger.error(f"Error disconnecting from {server_name}: {e}")
-        
+
         # Clear all state
         self.persistent_sessions.clear()
         self.tools_cache.clear()
-        
+
         logger.info("All MCP connections closed")
 
 
@@ -683,14 +782,13 @@ _mcp_client: Optional[MCPClient] = None
 def get_mcp_client() -> Optional[MCPClient]:
     """Get or create the global MCP client instance."""
     global _mcp_client
-    
+
     if not MCP_AVAILABLE:
         logger.warning("MCP SDK not available. Install with: pip install mcp")
         return None
-    
+
     if _mcp_client is None:
         mcp_service = MCPService()
         _mcp_client = MCPClient(mcp_service)
-    
-    return _mcp_client
 
+    return _mcp_client
