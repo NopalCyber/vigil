@@ -25,6 +25,21 @@ def _has_active_provider() -> bool:
     return _get_working_provider_spec() is not None
 
 
+def _get_model_context_window(provider_type: str, model_id: str) -> int:
+    """Known context window for provider_type/model_id, or 0 if unknown.
+
+    0 means "don't gate on this" — an unrecognized model shouldn't block
+    a run just because the registry hasn't been told its size yet.
+    """
+    try:
+        from services.model_registry import _catalog_entry
+
+        return int(_catalog_entry(provider_type, model_id).get("context_window") or 0)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_get_model_context_window lookup failed: %s", exc)
+        return 0
+
+
 def _mcp_result_text(result: Any) -> str:
     """Extract plain text from an MCP call_tool result dict."""
     if isinstance(result, str):
@@ -143,6 +158,42 @@ async def _router_agentic_chat(
                 for t in filtered
                 if t["function"]["name"] in tool_server_map
             }
+
+    # Pre-flight context-length check (#observed on EC2: a deployment with
+    # its OpenAI provider's default_model set to base "gpt-4" — 8,192
+    # tokens — silently overflowed once this workflow's curated tool
+    # schemas were added, surfacing as an opaque provider 400
+    # context_length_exceeded instead of an actionable Vigil error).
+    # Char-heuristic estimate only (no network call) — good enough to
+    # catch a model whose context window is clearly too small for a
+    # tool-heavy workflow; not meant to be exact.
+    _context_window = _get_model_context_window(provider.provider_type, provider.default_model)
+    if _context_window:
+        from services.cost_estimator import _char_heuristic_tokens
+
+        _tools_chars = len(_json.dumps(openai_tools, default=str)) if openai_tools else 0
+        _est_input_tokens = _char_heuristic_tokens(message) + _char_heuristic_tokens(system_prompt) + (
+            _tools_chars // 4
+        )
+        _needed = _est_input_tokens + max_tokens
+        if _needed > _context_window:
+            logger.error(
+                "[workflow] %s/%s context window (%d tokens) is too small for this "
+                "request (~%d tokens estimated: %d prompt + %d for %d tool schemas + "
+                "%d max_tokens budget)",
+                provider.provider_type, provider.default_model, _context_window,
+                _needed, _est_input_tokens - (_tools_chars // 4), _tools_chars // 4,
+                len(openai_tools), max_tokens,
+            )
+            return (
+                f"Cannot run this workflow: the configured model "
+                f"({provider.provider_type}/{provider.default_model}) has a "
+                f"{_context_window}-token context window, but this request needs "
+                f"approximately {_needed} tokens (prompt + {len(openai_tools)} tool "
+                f"schemas + response budget). Select a model with a larger context "
+                f"window (e.g. gpt-4o, gpt-4-turbo, gpt-4.1, or a Claude model) in "
+                f"Settings → AI / LLM Providers."
+            )
 
     router = LLMRouter()
     messages: List[Dict] = [{"role": "user", "content": message}]

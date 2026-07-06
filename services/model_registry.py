@@ -226,6 +226,22 @@ _CATALOG: Dict[Tuple[str, str], Dict[str, Any]] = {
         "supports_thinking": False,
         "supports_vision": True,
     },
+    # Base GPT-4 — distinct from gpt-4-turbo/gpt-4o/gpt-4.1 above. Only an
+    # 8K context window; readily overflows once a tool-heavy workflow's
+    # curated MCP tool schemas (easily several thousand tokens on their
+    # own) are added to the prompt. Listed explicitly (rather than falling
+    # through to the tier-heuristic default) so it shows its true, much
+    # smaller context size in the UI instead of looking indistinguishable
+    # from its 128K-context siblings.
+    ("openai", "gpt-4"): {
+        "display_name": "GPT-4",
+        "context_window": 8_192,
+        "input_per_m": 30.0,
+        "output_per_m": 60.0,
+        "supports_tools": True,
+        "supports_thinking": False,
+        "supports_vision": False,
+    },
 }
 
 
