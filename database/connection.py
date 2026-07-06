@@ -430,6 +430,17 @@ def get_db_manager() -> DatabaseManager:
     caller (including this one) reaches here first, ``.initialize()``'s
     own idempotency guard means a later ``echo=True`` request no-ops.
 
+    MAINTENANCE NOTE: this exact lazy-init-under-lock pattern is
+    independently duplicated in two other codebases that can't import this
+    module directly (separate git repos, not a shared package):
+      - deeptempo-core/deeptempo_core/database/connection.py (own
+        DatabaseManager singleton)
+      - mcp-servers/servers/deeptempo_findings.py's get_data_service()
+        (guards DatabaseDataService construction with its own lock)
+    If you change the race-handling logic here, check whether the same
+    change applies to those two as well, or the fix will silently drift
+    between them.
+
     Returns:
         DatabaseManager instance
     """
