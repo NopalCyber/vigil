@@ -89,6 +89,8 @@ def _persist_chat_turn(
         )
     except Exception as exc:  # noqa: BLE001 — fail-open, never break the chat
         logger.warning("chat history write-through failed (non-fatal): %s", exc)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -205,6 +207,7 @@ def _get_openai_mcp_tools():
     """
     try:
         from services.mcp_client import get_mcp_client
+
         mcp_client = get_mcp_client()
         if not mcp_client or not mcp_client.tools_cache:
             return [], {}
@@ -217,14 +220,18 @@ def _get_openai_mcp_tools():
         for tool in server_tools:
             raw_name = tool["name"]
             full_name = f"{server_name}_{raw_name}"[:64]
-            openai_tools.append({
-                "type": "function",
-                "function": {
-                    "name": full_name,
-                    "description": f"[{server_name}] {tool.get('description', '')}",
-                    "parameters": tool.get("inputSchema", {"type": "object", "properties": {}}),
-                },
-            })
+            openai_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": full_name,
+                        "description": f"[{server_name}] {tool.get('description', '')}",
+                        "parameters": tool.get(
+                            "inputSchema", {"type": "object", "properties": {}}
+                        ),
+                    },
+                }
+            )
             tool_server_map[full_name] = (server_name, raw_name)
     return openai_tools, tool_server_map
 
@@ -279,7 +286,9 @@ def _filter_openai_tools(
         # agent was defined before MCP existed. Pass all MCP tools through.
         return openai_tools, tool_server_map
 
-    filtered_map = {t["function"]["name"]: tool_server_map[t["function"]["name"]] for t in filtered}
+    filtered_map = {
+        t["function"]["name"]: tool_server_map[t["function"]["name"]] for t in filtered
+    }
     return filtered, filtered_map
 
 
@@ -575,7 +584,11 @@ async def chat(request: ChatRequest):
             _effective_sys = (
                 system_prompt
                 if system_prompt
-                else (ROUTER_WITH_TOOLS_SYSTEM_PROMPT if _oai_tools else ROUTER_NO_TOOLS_SYSTEM_PROMPT)
+                else (
+                    ROUTER_WITH_TOOLS_SYSTEM_PROMPT
+                    if _oai_tools
+                    else ROUTER_NO_TOOLS_SYSTEM_PROMPT
+                )
             )
             _mcp = _get_mcp() if _tool_server_map else None
             _loop_msgs = list(messages)
@@ -596,18 +609,23 @@ async def chat(request: ChatRequest):
                     response = _result.get("content", "")
                     break
                 # Append assistant message with tool calls
-                _loop_msgs.append({
-                    "role": "assistant",
-                    "content": _result.get("content") or None,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                        }
-                        for tc in _tcs
-                    ],
-                })
+                _loop_msgs.append(
+                    {
+                        "role": "assistant",
+                        "content": _result.get("content") or None,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                },
+                            }
+                            for tc in _tcs
+                        ],
+                    }
+                )
                 # Execute each tool call and append tool results
                 for tc in _tcs:
                     _fn = tc.function.name
@@ -624,40 +642,49 @@ async def chat(request: ChatRequest):
                         _tc_text = _mcp_tool_result_text(_tr)
                     else:
                         _tc_text = f"Tool '{_fn}' not available."
-                    _loop_msgs.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": _tc_text,
-                    })
+                    _loop_msgs.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": _tc_text,
+                        }
+                    )
             else:
                 response = _result.get("content", "")
-                if not response:
-                    # Loop exhausted all 6 rounds still calling tools — the
-                    # last dispatch had no room to also write prose. Force
-                    # one more call with tools disabled so the model must
-                    # answer instead of silently returning empty text.
-                    logger.info(
-                        f"🔁 [RequestID: {request_id}] Router loop exhausted 6 rounds "
-                        "still calling tools — forcing a final no-tools response"
-                    )
-                    _loop_msgs.append({
+
+            if not response:
+                # Either the very first turn returned no tool calls and no
+                # text (e.g. an empty completion), or the loop exhausted all
+                # 6 rounds still calling tools — either way the model hasn't
+                # produced a final answer yet. Force one more call with
+                # tools disabled so it must answer instead of silently
+                # returning empty text. Previously this recovery lived only
+                # in the loop-exhausted (for/else) branch, so a first-turn
+                # empty response skipped it entirely via the early break.
+                logger.info(
+                    f"🔁 [RequestID: {request_id}] Router loop produced no text "
+                    "— forcing a final no-tools response"
+                )
+                _loop_msgs.append(
+                    {
                         "role": "user",
                         "content": (
                             "Based on all the tool results above, provide your "
                             "complete final answer now — do not make any more "
                             "tool calls."
                         ),
-                    })
-                    _result = await LLMRouter().dispatch(
-                        provider=active_provider,
-                        messages=_loop_msgs,
-                        system_prompt=_effective_sys,
-                        model=request.model,
-                        max_tokens=max_tokens,
-                        tools=None,
-                        interaction_id=request_id,
-                    )
-                    response = _result.get("content", "")
+                    }
+                )
+                _result = await LLMRouter().dispatch(
+                    provider=active_provider,
+                    messages=_loop_msgs,
+                    system_prompt=_effective_sys,
+                    model=request.model,
+                    max_tokens=max_tokens,
+                    tools=None,
+                    interaction_id=request_id,
+                )
+                response = _result.get("content", "")
         elif request.use_agent_sdk and claude_service.use_agent_sdk:
             # Extract text from current message for agent query
             if isinstance(current_message, list):
@@ -1000,7 +1027,11 @@ async def chat_stream(
                 _effective_sys = (
                     system_prompt
                     if system_prompt
-                    else (ROUTER_WITH_TOOLS_SYSTEM_PROMPT if _oai_tools else ROUTER_NO_TOOLS_SYSTEM_PROMPT)
+                    else (
+                        ROUTER_WITH_TOOLS_SYSTEM_PROMPT
+                        if _oai_tools
+                        else ROUTER_NO_TOOLS_SYSTEM_PROMPT
+                    )
                 )
                 logger.info(
                     f"🚀 [RequestID: {request_id}] Starting router stream ({active_provider.provider_type}) "
@@ -1027,18 +1058,23 @@ async def chat_stream(
                         if not _tcs:
                             _final_text = _result.get("content", "")
                             break
-                        _loop_msgs.append({
-                            "role": "assistant",
-                            "content": _result.get("content") or None,
-                            "tool_calls": [
-                                {
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                                }
-                                for tc in _tcs
-                            ],
-                        })
+                        _loop_msgs.append(
+                            {
+                                "role": "assistant",
+                                "content": _result.get("content") or None,
+                                "tool_calls": [
+                                    {
+                                        "id": tc.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc.function.name,
+                                            "arguments": tc.function.arguments,
+                                        },
+                                    }
+                                    for tc in _tcs
+                                ],
+                            }
+                        )
                         for tc in _tcs:
                             _fn = tc.function.name
                             try:
@@ -1050,43 +1086,55 @@ async def chat_stream(
                                 logger.info(
                                     f"🔧 [RequestID: {request_id}] Tool call: {_raw} on {_srv}"
                                 )
-                                _tr = await _mcp.call_tool(_srv, _raw, _args, timeout=60.0)
+                                _tr = await _mcp.call_tool(
+                                    _srv, _raw, _args, timeout=60.0
+                                )
                                 _tc_text = _mcp_tool_result_text(_tr)
                             else:
                                 _tc_text = f"Tool '{_fn}' not available."
-                            _loop_msgs.append({
-                                "role": "tool",
-                                "tool_call_id": tc.id,
-                                "content": _tc_text,
-                            })
+                            _loop_msgs.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tc.id,
+                                    "content": _tc_text,
+                                }
+                            )
                     else:
                         _final_text = _result.get("content", "")
-                        if not _final_text:
-                            # Same fix as the non-streaming chat path: force
-                            # one more no-tools call so 6 rounds of pure
-                            # tool-calling doesn't end in empty text.
-                            logger.info(
-                                f"🔁 [RequestID: {request_id}] Router stream loop exhausted "
-                                "6 rounds still calling tools — forcing a final no-tools response"
-                            )
-                            _loop_msgs.append({
+
+                    if not _final_text:
+                        # Either the very first turn returned no tool calls
+                        # and no text, or the loop exhausted all 6 rounds
+                        # still calling tools — either way force one more
+                        # no-tools call so the model must answer instead of
+                        # silently returning empty text. Previously this
+                        # only ran in the loop-exhausted (for/else) branch,
+                        # so a first-turn empty response skipped it via the
+                        # early break.
+                        logger.info(
+                            f"🔁 [RequestID: {request_id}] Router stream loop produced no text "
+                            "— forcing a final no-tools response"
+                        )
+                        _loop_msgs.append(
+                            {
                                 "role": "user",
                                 "content": (
                                     "Based on all the tool results above, provide your "
                                     "complete final answer now — do not make any more "
                                     "tool calls."
                                 ),
-                            })
-                            _result = await LLMRouter().dispatch(
-                                provider=active_provider,
-                                messages=_loop_msgs,
-                                system_prompt=_effective_sys,
-                                model=request.model,
-                                max_tokens=max_tokens,
-                                tools=None,
-                                interaction_id=request_id,
-                            )
-                            _final_text = _result.get("content", "")
+                            }
+                        )
+                        _result = await LLMRouter().dispatch(
+                            provider=active_provider,
+                            messages=_loop_msgs,
+                            system_prompt=_effective_sys,
+                            model=request.model,
+                            max_tokens=max_tokens,
+                            tools=None,
+                            interaction_id=request_id,
+                        )
+                        _final_text = _result.get("content", "")
                     elapsed_time = time.time() - start_time
                     logger.info(
                         f"✅ [RequestID: {request_id}] Router agentic loop complete in {elapsed_time:.2f}s"
@@ -1220,9 +1268,7 @@ async def chat_stream(
                         complete=history_reached_end,
                     )
                 except Exception as exc:  # noqa: BLE001 — fail-open
-                    logger.warning(
-                        "chat history persist failed (non-fatal): %s", exc
-                    )
+                    logger.warning("chat history persist failed (non-fatal): %s", exc)
 
     return StreamingResponse(
         generate(),
