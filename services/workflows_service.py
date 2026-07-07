@@ -78,6 +78,34 @@ def _get_working_provider_spec():
     return None
 
 
+def _get_default_provider_spec():
+    """Return the provider row flagged ``is_default=True``, regardless of
+    ``is_active``/key-resolvability. Used for cost-estimate telemetry, where
+    the configured default is the right answer even if it isn't currently
+    dispatchable -- unlike ``_get_working_provider_spec()``, which is for
+    actual dispatch and deliberately skips a non-working default.
+    """
+    try:
+        from database.connection import get_db_session
+        from database.models import LLMProviderConfig
+        from services.llm_router import provider_spec_from_row
+
+        session = get_db_session()
+        try:
+            row = (
+                session.query(LLMProviderConfig)
+                .filter(LLMProviderConfig.is_default.is_(True))
+                .first()
+            )
+            if row is not None:
+                return provider_spec_from_row(row)
+        finally:
+            session.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_get_default_provider_spec failed: %s", exc)
+    return None
+
+
 _CONTINUE_NUDGE = (
     "Continue. Have you fully completed every phase this task requires, "
     "including any final report and required tool calls (e.g. case "
@@ -1046,9 +1074,20 @@ For each phase:
         try:
             from services.cost_estimator import estimate_cost
 
+            if use_claude:
+                _cost_provider_type, _cost_model_id = "anthropic", DEFAULT_MODEL
+            else:
+                _cost_spec = _get_default_provider_spec()
+                _cost_provider_type = (
+                    _cost_spec.provider_type if _cost_spec else "openai"
+                )
+                _cost_model_id = (
+                    _cost_spec.default_model if _cost_spec else DEFAULT_MODEL
+                )
+
             _est = await estimate_cost(
-                provider_type="anthropic",
-                model_id=DEFAULT_MODEL,
+                provider_type=_cost_provider_type,
+                model_id=_cost_model_id,
                 messages=[{"role": "user", "content": prompt}],
                 system_prompt=system_prompt,
                 max_tokens=ONESHOT_MAX_TOKENS,
@@ -1335,9 +1374,25 @@ For each phase:
             try:
                 from services.cost_estimator import estimate_cost
 
+                if _use_claude:
+                    _phase_cost_provider_type, _phase_cost_model_id = (
+                        "anthropic",
+                        DEFAULT_MODEL,
+                    )
+                else:
+                    _phase_cost_spec = _get_default_provider_spec()
+                    _phase_cost_provider_type = (
+                        _phase_cost_spec.provider_type if _phase_cost_spec else "openai"
+                    )
+                    _phase_cost_model_id = (
+                        _phase_cost_spec.default_model
+                        if _phase_cost_spec
+                        else DEFAULT_MODEL
+                    )
+
                 _phase_est = await estimate_cost(
-                    provider_type="anthropic",
-                    model_id=DEFAULT_MODEL,
+                    provider_type=_phase_cost_provider_type,
+                    model_id=_phase_cost_model_id,
                     messages=[{"role": "user", "content": phase_prompt}],
                     system_prompt=system_prompt,
                     max_tokens=8192,
