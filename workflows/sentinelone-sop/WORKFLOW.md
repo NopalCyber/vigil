@@ -304,9 +304,26 @@ supporting evidence/reasoning — what the activity did or could do]
 
 ---
 
-4. **If TRUE POSITIVE:** Call `create_case` with title `"TP: [threat_name] on [hostname]"`,
-   linked to the finding_id, and include the full report as the case description. Then call
-   `escalate_case` on the newly created case to notify the account owner (SOP §2: "Escalate it
+4. **VERDICT GATE — do this before calling any tool in this step.** Re-read the exact
+   **Verdict** string you just wrote in section 6.2. It is one of three values:
+   `True Positive`, `False Positive`, or `Validation Required`. Compare it literally:
+   - Verdict is **exactly** `True Positive` → proceed to step 4a below.
+   - Verdict is `False Positive` or `Validation Required` → **stop here.** Skip step 4a
+     entirely and go straight to step 5. Do not call `create_case` or `escalate_case` —
+     not even to "document" or "flag for visibility." Those two tools are TP-only. Calling
+     them for a non-TP verdict is a SOP violation regardless of how you justify it in the
+     call arguments.
+
+   **4a. TRUE POSITIVE only** — call `create_case` with:
+   - `title`: `"TP: [threat_name] on [hostname]"` — the `TP:` prefix is only valid here,
+     because you already confirmed the verdict is exactly True Positive
+   - `description`: the full report (sections 6.1–6.3 above), verbatim — not a shortened summary
+   - `severity`: **required by this tool — never omit it.** Map from the Severity captured in
+     Phase 1 (3.1): `"critical"` if Severity is Critical, `"high"` if High, `"medium"` if Medium,
+     `"low"` if Low/Informational
+   - `finding_ids`: `["<finding_id>"]` — an array containing the Vigil finding_id (the `s1-`
+     prefixed one from Phase 1), NOT the numeric `external_id`
+   Then call `escalate_case` on the newly created case to notify the account owner (SOP §2: "Escalate it
    to customer"):
    - `escalated_from`: `"vigil-ai-sentinelone-sop"`
    - `escalated_to`: the Site / Group / Account captured in Phase 1 (3.2) if available, otherwise
@@ -314,10 +331,13 @@ supporting evidence/reasoning — what the activity did or could do]
    - `reason`: one-line summary of the verdict (e.g. `"Confirmed malware on <hostname>: <threat_name>"`)
    - `urgency_level`: `"critical"` if Severity is Critical/High, otherwise `"high"` — a confirmed
      True Positive is never escalated below `"high"`
-5. **If FALSE POSITIVE or VALIDATION REQUIRED:** Do not auto-create a case and do not escalate;
-   document the outcome in the report and note it for analyst review.
+5. **If FALSE POSITIVE or VALIDATION REQUIRED (per the gate in step 4):** Do not auto-create a
+   case and do not escalate — the finished report text (6.1–6.3) IS the deliverable for these
+   two verdicts. Note the outcome for analyst review and end the workflow here.
 
-**Output:** Completed SOP report (sections 6.1 / 6.2 / 6.3), case_id and escalation record if TP.
+**Output:** Completed SOP report (sections 6.1 / 6.2 / 6.3). `case_id` and escalation record
+ONLY when the verdict gate in step 4 confirmed True Positive — absent for False Positive /
+Validation Required.
 
 ---
 

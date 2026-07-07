@@ -204,14 +204,24 @@ class FindingProcessor:
         item_type = item.get("type")
 
         if item_type == "finding":
-            await self._process_finding(item["data"], item.get("source"))
+            await self._process_finding(
+                item["data"], item.get("source"), skip_triage=item.get("skip_triage", False)
+            )
         else:
             logger.warning(f"Unknown item type: {item_type}")
 
     async def _process_finding(
-        self, finding: Dict[str, Any], source: Optional[str] = None
+        self,
+        finding: Dict[str, Any],
+        source: Optional[str] = None,
+        skip_triage: bool = False,
     ):
-        """Process a finding through triage and enrichment."""
+        """Process a finding through triage and enrichment.
+
+        ``skip_triage``: set by the poller/federation runner for findings
+        pulled in by a source's initial cold-start backfill -- historical
+        data shouldn't cost an AI triage call per finding.
+        """
         finding_id = finding.get("finding_id", "unknown")
         logger.debug(f"Processing finding {finding_id} from {source}")
 
@@ -241,8 +251,13 @@ class FindingProcessor:
             if self._data_service:
                 await self._store_finding(finding)
 
-            # AI Triage (routed through LLM queue)
-            if self.config.auto_triage_enabled:
+            # AI Triage (routed through LLM queue) -- skipped for findings
+            # from a source's initial cold-start backfill.
+            if skip_triage:
+                logger.debug(
+                    f"Skipping AI triage for {finding_id} (initial sync backfill)"
+                )
+            elif self.config.auto_triage_enabled:
                 finding = await self._triage_finding(finding)
 
             # Enrichment

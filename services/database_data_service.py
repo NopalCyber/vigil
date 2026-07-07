@@ -53,7 +53,14 @@ class DatabaseDataService:
             self._demo_service = get_demo_service()
         else:
             self._init_database(require_db)
-        DATA_DIR.mkdir(exist_ok=True)
+        # Only needed when the JSON fallback is actually active -- skip it
+        # when Postgres is available, and never let a filesystem hiccup here
+        # take down an otherwise-healthy Postgres-backed service.
+        if self._use_json_fallback:
+            try:
+                DATA_DIR.mkdir(exist_ok=True)
+            except OSError as e:
+                logger.warning(f"Could not create JSON fallback data dir {DATA_DIR}: {e}")
 
     def _init_database(self, require_db: bool = False):
         try:

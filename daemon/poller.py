@@ -586,8 +586,16 @@ class DataPoller:
         await runner.cleanup()
         logger.info("Webhook server stopped")
 
-    async def _enqueue_finding(self, finding: Dict[str, Any], source: str):
-        """Add finding to output queue for processing."""
+    async def _enqueue_finding(
+        self, finding: Dict[str, Any], source: str, skip_triage: bool = False
+    ):
+        """Add finding to output queue for processing.
+
+        ``skip_triage`` marks findings pulled in by an initial-sync backfill
+        (see ``_poll_sentinelone``) so the processor stores them without
+        spending an AI triage call on every historical finding a fresh
+        integration pulls in on day one.
+        """
         if self._output_queue:
             await self._output_queue.put(
                 {
@@ -595,6 +603,7 @@ class DataPoller:
                     "source": source,
                     "data": finding,
                     "timestamp": datetime.utcnow().isoformat(),
+                    "skip_triage": skip_triage,
                 }
             )
             logger.debug(f"Enqueued finding {finding.get('finding_id')} from {source}")
@@ -827,7 +836,8 @@ class DataPoller:
 
         try:
             # First run (no prior poll): fetch last 7 days for initial backfill
-            if self._sentinelone_state.last_poll_time is None:
+            is_initial_sync = self._sentinelone_state.last_poll_time is None
+            if is_initial_sync:
                 lookback_minutes = 7 * 24 * 60
             else:
                 lookback_minutes = max(self.config.sentinelone_interval // 60 + 1, 2)
@@ -849,7 +859,12 @@ class DataPoller:
                 if finding and not await self._sentinelone_dedup.is_processed(
                     finding["finding_id"]
                 ):
-                    await self._enqueue_finding(finding, "sentinelone")
+                    # Don't burn an AI triage call on every historical threat
+                    # from the initial 7-day backfill -- only live, ongoing
+                    # threats should hit the LLM.
+                    await self._enqueue_finding(
+                        finding, "sentinelone", skip_triage=is_initial_sync
+                    )
                     await self._sentinelone_dedup.mark_processed(finding["finding_id"])
                     new_count += 1
 

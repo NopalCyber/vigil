@@ -125,14 +125,27 @@ async def _claude_chat_until_complete(
     model: str,
     max_tokens: int,
     recommended_tools: Optional[List[str]],
+    max_continuation_nudges: int = _MAX_CONTINUATION_NUDGES,
+    max_tool_rounds: int = 5,
 ) -> Optional[str]:
     """claude_service.chat(), but nudges the model to keep going instead of
-    stopping after a "moving to Phase 2" text reply with no tool call."""
+    stopping after a "moving to Phase 2" text reply with no tool call.
+
+    ``max_continuation_nudges``/``max_tool_rounds`` default to the historical
+    per-call budget. The one-shot workflow path (a single call driving an
+    entire multi-phase SOP with 20-30 sequential tool calls) passes larger
+    values -- see _execute_oneshot -- so it gets headroom comparable to the
+    non-Anthropic router path's max_turns=60/max_continuation_nudges=6
+    (#observed on EC2: a 4-phase SOP exhausted the old, smaller budget and
+    truncated after Phase 1; ClaudeService.chat() also now forces a final
+    summary instead of discarding collected tool results when its own
+    tool-round cap is hit).
+    """
     context: List[Dict[str, Any]] = []
     collected_texts: List[str] = []
     current_message = message
 
-    for _ in range(_MAX_CONTINUATION_NUDGES + 1):
+    for _ in range(max_continuation_nudges + 1):
         response = await asyncio.to_thread(
             claude_service.chat,
             message=current_message,
@@ -141,6 +154,7 @@ async def _claude_chat_until_complete(
             max_tokens=max_tokens,
             recommended_tools=recommended_tools,
             context=context or None,
+            max_tool_rounds=max_tool_rounds,
         )
         if not response:
             break
@@ -1126,6 +1140,12 @@ For each phase:
                     model=DEFAULT_MODEL,
                     max_tokens=ONESHOT_MAX_TOKENS,
                     recommended_tools=all_tools if all_tools else None,
+                    # Parity with the non-Anthropic router path's
+                    # max_turns=60/max_continuation_nudges=6 for this same
+                    # oneshot case -- a tool-heavy multi-phase SOP needs more
+                    # than the historical per-call default budget.
+                    max_continuation_nudges=6,
+                    max_tool_rounds=15,
                 )
             else:
                 response_text = await _router_agentic_chat(

@@ -2042,6 +2042,7 @@ Your goal is to help SOC analysts work more efficiently by leveraging all availa
         agent_id: Optional[str] = None,
         investigation_id: Optional[str] = None,
         recommended_tools: Optional[List[str]] = None,
+        max_tool_rounds: int = 5,
     ) -> Optional[str]:
         """
         Send a chat message to Claude.
@@ -2059,6 +2060,11 @@ Your goal is to help SOC analysts work more efficiently by leveraging all availa
             session_id: Chat/session identifier for reasoning-trace persistence.
             agent_id: Agent identifier (e.g. 'investigator') for reasoning-trace attribution.
             investigation_id: Investigation identifier if this call is part of one.
+            max_tool_rounds: Cap on follow-up tool-use rounds within this single
+                call (default 5, matching prior behavior). Callers driving a
+                long tool-heavy task in one call (e.g. the workflow engine's
+                one-shot path) can raise this instead of losing all collected
+                tool results when the default cap is exhausted.
 
         Returns:
             Claude's response text or None if error.
@@ -2423,8 +2429,8 @@ Your goal is to help SOC analysts work more efficiently by leveraging all availa
                     # cache entry keeps getting hit.
                     self._apply_prompt_cache_controls(api_kwargs)
 
-                    # Loop to handle multiple rounds of tool use (max 5 rounds)
-                    for tool_round in range(5):
+                    # Loop to handle multiple rounds of tool use (default: max 5 rounds)
+                    for tool_round in range(max_tool_rounds):
                         logger.debug(
                             f"🔁 Making follow-up API call after tool use (round {tool_round + 1})"
                         )
@@ -2545,7 +2551,36 @@ Your goal is to help SOC analysts work more efficiently by leveraging all availa
 
                         break
 
-                    logger.warning("⚠️ Tool use loop exhausted without text response")
+                    logger.warning(
+                        "⚠️ Tool use loop exhausted after %d rounds -- forcing a "
+                        "final summary instead of discarding collected tool results",
+                        max_tool_rounds,
+                    )
+                    try:
+                        forced_kwargs = dict(api_kwargs)
+                        forced_kwargs.pop("tools", None)
+                        forced_kwargs["messages"] = messages + [
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Based on all the investigation work and tool "
+                                    "results above, provide your complete final "
+                                    "analysis, findings, and recommendations. Write "
+                                    "your full response now -- do not make any more "
+                                    "tool calls."
+                                ),
+                            }
+                        ]
+                        forced_response = self.client.messages.create(**forced_kwargs)
+                        if forced_response.content:
+                            return self._extract_content_blocks(
+                                forced_response.content, use_thinking
+                            )
+                    except Exception as forced_err:
+                        logger.error(
+                            "Forced final summary after tool-loop exhaustion failed: %s",
+                            forced_err,
+                        )
                     return None
                 finally:
                     loop.close()

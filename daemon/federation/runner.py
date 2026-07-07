@@ -178,6 +178,13 @@ class FederationRunner:
         max_items = int(row.get("max_items") or 100)
         cursor = row.get("cursor") or {}
         min_severity = row.get("min_severity")
+        # An empty cursor means this source has never advanced a watermark
+        # before -- i.e. this fetch is (or continues) the adapter's initial
+        # cold-start backfill (e.g. SentinelOneAdapter's 30-day window).
+        # Skip AI triage for those so a fresh integration doesn't burn one
+        # LLM call per historical finding on day one; live findings on every
+        # later tick (non-empty cursor) still get triaged normally.
+        is_initial_sync = not cursor
 
         self.stats["polls"] = self.stats.get("polls", 0) + 1
         try:
@@ -202,7 +209,7 @@ class FederationRunner:
             dedup = self._dedup[source_id]
             if await dedup.is_processed(ext):
                 continue
-            await self._enqueue(finding, source_id)
+            await self._enqueue(finding, source_id, skip_triage=is_initial_sync)
             await dedup.mark_processed(ext)
             new_count += 1
 
@@ -212,7 +219,9 @@ class FederationRunner:
 
         store.record_success(source_id, cursor=result.cursor or {})
 
-    async def _enqueue(self, finding: Dict[str, Any], source_id: str) -> None:
+    async def _enqueue(
+        self, finding: Dict[str, Any], source_id: str, skip_triage: bool = False
+    ) -> None:
         if self._output_queue is None:
             return
         await self._output_queue.put(
@@ -221,6 +230,7 @@ class FederationRunner:
                 "source": source_id,
                 "data": finding,
                 "timestamp": datetime.utcnow().isoformat(),
+                "skip_triage": skip_triage,
             }
         )
 
