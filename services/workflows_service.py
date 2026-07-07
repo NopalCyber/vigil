@@ -78,6 +78,58 @@ def _get_working_provider_spec():
     return None
 
 
+_CONTINUE_NUDGE = (
+    "Continue. Have you fully completed every phase this task requires, "
+    "including any final report and required tool calls (e.g. case "
+    "creation)? If any phase or step remains, do it now -- call the next "
+    "tool or write the next phase's content; do not just describe what "
+    "you are about to do. If it is genuinely complete, reply with "
+    "exactly: WORKFLOW COMPLETE"
+)
+_COMPLETE_SENTINEL = "WORKFLOW COMPLETE"
+_MAX_CONTINUATION_NUDGES = 3
+
+
+async def _claude_chat_until_complete(
+    claude_service: Any,
+    message: str,
+    system_prompt: str,
+    model: str,
+    max_tokens: int,
+    recommended_tools: Optional[List[str]],
+) -> Optional[str]:
+    """claude_service.chat(), but nudges the model to keep going instead of
+    stopping after a "moving to Phase 2" text reply with no tool call."""
+    context: List[Dict[str, Any]] = []
+    collected_texts: List[str] = []
+    current_message = message
+
+    for _ in range(_MAX_CONTINUATION_NUDGES + 1):
+        response = await asyncio.to_thread(
+            claude_service.chat,
+            message=current_message,
+            system_prompt=system_prompt,
+            model=model,
+            max_tokens=max_tokens,
+            recommended_tools=recommended_tools,
+            context=context or None,
+        )
+        if not response:
+            break
+
+        if response.strip().strip(".").upper() == _COMPLETE_SENTINEL:
+            break
+
+        collected_texts.append(response)
+        context = context + [
+            {"role": "user", "content": current_message},
+            {"role": "assistant", "content": response},
+        ]
+        current_message = _CONTINUE_NUDGE
+
+    return "\n\n".join(collected_texts) if collected_texts else None
+
+
 async def _router_agentic_chat(
     message: str,
     system_prompt: str,
@@ -208,10 +260,20 @@ async def _router_agentic_chat(
     router = LLMRouter()
     messages: List[Dict] = [{"role": "user", "content": message}]
     last_result: Dict = {}
-    max_turns = 25
+    # nudge_until_complete marks the oneshot composite-prompt case (all of a
+    # multi-phase workflow in one call). Models that resolve tool inputs from
+    # a prior tool's output (e.g. extract a hash, then look it up) mostly
+    # issue one tool call per turn, so a 4-phase SOP with ~25-30 sequential
+    # calls can exhaust a small shared turn budget partway through Phase
+    # 1/2 -- the loop then falls through to the forced-final-summary path
+    # below and reports only whatever got investigated before the budget
+    # ran out (observed on EC2: report truncated after Phase 1). A single
+    # ``_execute_phased`` phase call never needs this much headroom, so the
+    # larger cap is confined to the oneshot case.
+    max_turns = 60 if nudge_until_complete else 25
     # Bounded nudges so a model that keeps "planning" instead of finishing
     # can't turn this into an unbounded (and unboundedly expensive) loop.
-    max_continuation_nudges = 3
+    max_continuation_nudges = 6 if nudge_until_complete else 3
     nudges_used = 0
     collected_texts: List[str] = []
     _COMPLETE_SENTINEL = "WORKFLOW COMPLETE"
@@ -1018,8 +1080,8 @@ For each phase:
 
         try:
             if use_claude:
-                response_text = await asyncio.to_thread(
-                    claude_service.chat,
+                response_text = await _claude_chat_until_complete(
+                    claude_service,
                     message=prompt,
                     system_prompt=system_prompt,
                     model=DEFAULT_MODEL,
