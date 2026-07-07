@@ -208,7 +208,11 @@ class DatabaseManager:
             echo: If True, log all SQL statements
         """
         if self._engine is not None:
-            logger.warning("Database already initialized")
+            # Expected: every ad-hoc `DatabaseDataService()` instantiation
+            # (many request handlers create one locally) re-triggers this
+            # no-op guard. Not a warning-worthy condition -- was previously
+            # logged at WARNING and spammed the logs on nearly every request.
+            logger.debug("Database already initialized")
             return
 
         try:
