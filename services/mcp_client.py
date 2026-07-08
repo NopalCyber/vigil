@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Optional, Dict, List, Any, Tuple, TYPE_CHECKING
 from pathlib import Path
 import platform
@@ -33,6 +34,87 @@ except ImportError:
 from services.mcp_service import MCPService
 
 logger = logging.getLogger(__name__)
+
+# Deterministic backstop for deeptempo-findings.create_case/escalate_case,
+# the two case-management tools the SentinelOne SOP (and similar
+# investigation workflows) use to notify an account owner. Repeatedly
+# observed -- both locally and on EC2 (runs wfr-20260707-9b95c780,
+# wfr-20260708-b8b8a7aa) -- the model calls create_case/escalate_case with
+# a "TP:"-prefixed title while the full report it embeds as `description`
+# states, in its own **Verdict:** line, Validation Required or False
+# Positive. Prompt instructions alone (the workflow's own Phase 4 "verdict
+# gate") did not hold across repeated runs, so this catches the
+# self-contradiction in code instead.
+#
+# Deliberately NOT a length/"looks like a full report" check: a genuine,
+# correctly-verdicted True Positive case (case-20260707-2c362c73) had only
+# a 265-char description with no report formatting at all, while a
+# fabricated one (case-20260708-11140562, "confirmed malware... no real
+# supporting evidence") was 127 chars -- almost the same length, so length
+# doesn't discriminate between them and would have false-positived on the
+# genuine case. Catching a fabricated-but-internally-consistent
+# description (asserts a verdict with no contradicting text, but isn't
+# actually backed by the run's evidence) would need grounding against the
+# run's actual tool results, not text pattern matching -- out of scope
+# here; this only catches the model contradicting its own stated verdict.
+#
+# Scoped to the MCP tool-calling path only (services/mcp_client.py is the
+# single dispatch point every provider path -- Claude and the OpenAI/
+# router path alike -- calls through), which is exactly the AI-agent
+# surface; the case UI's manual escalate action goes through backend/api/
+# cases.py directly and never reaches this function.
+_CASE_TOOLS_REQUIRING_TP_CONFIRMATION = {"create_case", "escalate_case"}
+_NON_TP_VERDICT_RE = re.compile(
+    r"verdict\**\s*:?\s*\**\s*(validation required|false positive)",
+    re.IGNORECASE,
+)
+
+
+def _description_contradicts_true_positive(description: Optional[str]) -> bool:
+    """True if the report text's own stated verdict is not True Positive."""
+    if not description:
+        return False
+    return bool(_NON_TP_VERDICT_RE.search(description))
+
+
+def _case_action_rejection(tool_name: str, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return an MCP-style error result if a create_case/escalate_case call
+    should be blocked, or None to let it proceed."""
+    if tool_name == "create_case":
+        description = arguments.get("description") or ""
+        if not _description_contradicts_true_positive(description):
+            return None
+        msg = (
+            "create_case rejected: this report's own Verdict line does not "
+            "say True Positive. Do not call create_case for a False Positive "
+            "or Validation Required verdict -- document the outcome in your "
+            "final report text instead."
+        )
+        logger.warning(f"[mcp-guard] blocked create_case: {arguments.get('title')!r}")
+        return {"error": True, "content": [{"type": "text", "text": msg}]}
+
+    if tool_name == "escalate_case":
+        case_id = arguments.get("case_id")
+        description = ""
+        if case_id:
+            try:
+                from services.database_data_service import DatabaseDataService
+
+                case = DatabaseDataService().get_case(case_id)
+                description = (case or {}).get("description") or ""
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[mcp-guard] could not look up case {case_id}: {e}")
+        if not _description_contradicts_true_positive(description):
+            return None
+        msg = (
+            f"escalate_case rejected: case {case_id}'s own report states a "
+            "non-True-Positive verdict -- refusing to notify the account "
+            "owner for a case that isn't actually a confirmed True Positive."
+        )
+        logger.warning(f"[mcp-guard] blocked escalate_case for case_id={case_id}")
+        return {"error": True, "content": [{"type": "text", "text": msg}]}
+
+    return None
 
 
 class PersistentServerSession:
@@ -556,6 +638,14 @@ class MCPClient:
                 "error": f"Unknown server: {server_name}",
                 "content": [{"type": "text", "text": f"Unknown server: {server_name}"}],
             }
+
+        if (
+            server_name == "deeptempo-findings"
+            and tool_name in _CASE_TOOLS_REQUIRING_TP_CONFIRMATION
+        ):
+            _rejection = _case_action_rejection(tool_name, arguments)
+            if _rejection is not None:
+                return _rejection
 
         # Serialize arguments once and reuse for both the span attribute and
         # the log preview below -- this used to json.dumps the same dict

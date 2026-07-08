@@ -422,11 +422,28 @@ async def _dispatch_findings_tool(
         return data_service.get_case(**arguments)
 
     if tool_name == "create_case":
+        # Same deterministic backstop as the MCP create_case path (see
+        # services/mcp_client.py's _case_action_rejection) -- this backend
+        # tool and the MCP deeptempo-findings.create_case tool share the
+        # same name, so a Claude-path agent (which sees both backend and
+        # MCP tools at once) could resolve the call to either one.
+        from services.mcp_client import _description_contradicts_true_positive
+
+        description = arguments.get("description", "")
+        if _description_contradicts_true_positive(description):
+            return {
+                "error": (
+                    "create_case rejected: this report's own Verdict line "
+                    "does not say True Positive. Do not call create_case for "
+                    "a False Positive or Validation Required verdict -- "
+                    "document the outcome in your final report text instead."
+                )
+            }
         return data_service.create_case(
             title=arguments["title"],
             finding_ids=arguments.get("finding_ids", []),
             priority=arguments.get("severity", "medium"),
-            description=arguments.get("description", ""),
+            description=description,
         )
 
     if tool_name == "add_finding_to_case":
