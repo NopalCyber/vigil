@@ -430,7 +430,12 @@ async def _dispatch_findings_tool(
         from services.mcp_client import (
             _description_contradicts_true_positive,
             _description_is_complete_report,
+            _invalid_case_priority_message,
         )
+
+        _priority_error = _invalid_case_priority_message(arguments.get("severity"))
+        if _priority_error:
+            return {"error": _priority_error}
 
         description = arguments.get("description", "")
         if _description_contradicts_true_positive(description):
@@ -455,7 +460,7 @@ async def _dispatch_findings_tool(
         return data_service.create_case(
             title=arguments["title"],
             finding_ids=arguments.get("finding_ids", []),
-            priority=arguments.get("severity", "medium"),
+            priority=str(arguments["severity"]).strip().lower(),
             description=description,
         )
 

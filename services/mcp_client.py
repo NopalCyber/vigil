@@ -56,6 +56,11 @@ logger = logging.getLogger(__name__)
 # one-liners without being tight enough to reject genuinely shorter (but
 # real) reports we haven't seen yet.
 #
+# A third, independent check enforces a valid, explicit priority -- see
+# _invalid_case_priority_message for why the SOP's own field name for this
+# (`severity`) gets silently dropped by the actual MCP tool and defaults
+# to "medium" regardless of the finding's real severity.
+#
 # Catching a fabricated-but-internally-consistent, full-length description
 # (asserts a verdict with no contradicting text and clears the length bar,
 # but isn't actually backed by the run's evidence) is still out of scope
@@ -90,10 +95,51 @@ def _description_is_complete_report(description: Optional[str]) -> bool:
     return "verdict" in description.lower()
 
 
+_VALID_CASE_PRIORITIES = {"low", "medium", "high", "critical"}
+
+
+def _invalid_case_priority_message(priority: Optional[str]) -> Optional[str]:
+    """None if ``priority`` is a valid, explicit case priority; otherwise an
+    error message.
+
+    The MCP deeptempo-findings.create_case tool's actual parameter is
+    ``priority`` (mcp-servers/servers/deeptempo_findings.py, default
+    "medium"), and being a plain Python function with **kwargs, an
+    unrecognized keyword (e.g. the SOP's own ``severity``, which is what
+    the *other* create_case tool -- the backend-tools path in
+    tool_executor.py -- actually accepts) is silently swallowed and
+    ignored rather than erroring. Either way -- wrong key name or the key
+    just omitted -- the case silently gets filed as "medium" regardless
+    of the finding's real severity, with no error surfaced. Require an
+    explicit, valid value instead of trusting the default.
+    """
+    if not priority or str(priority).strip().lower() not in _VALID_CASE_PRIORITIES:
+        return (
+            "create_case rejected: a valid priority (low/medium/high/critical) is "
+            "required and must reflect the finding's actual Severity from Phase 1 -- "
+            'omitting it silently defaults to "medium" regardless of the real '
+            "severity, which can misfile a Critical/High finding."
+        )
+    return None
+
+
 def _case_action_rejection(tool_name: str, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Return an MCP-style error result if a create_case/escalate_case call
     should be blocked, or None to let it proceed."""
     if tool_name == "create_case":
+        # Normalize the SOP's `severity` field name into the MCP tool's
+        # actual `priority` parameter -- see _invalid_case_priority_message.
+        if "priority" not in arguments and "severity" in arguments:
+            arguments["priority"] = arguments.pop("severity")
+        _priority_error = _invalid_case_priority_message(arguments.get("priority"))
+        if _priority_error:
+            logger.warning(
+                f"[mcp-guard] blocked create_case (invalid priority): "
+                f"{arguments.get('title')!r}"
+            )
+            return {"error": True, "content": [{"type": "text", "text": _priority_error}]}
+        arguments["priority"] = str(arguments["priority"]).strip().lower()
+
         description = arguments.get("description") or ""
         if _description_contradicts_true_positive(description):
             msg = (
