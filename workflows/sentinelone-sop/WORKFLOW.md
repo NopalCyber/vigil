@@ -105,6 +105,11 @@ supports the investigation.
 6. Call `virustotal_get_file_report` with the SHA256 hash extracted from `entity_context.file_hashes` in step 5 above (the 64-character string). This is mandatory — if `entity_context.file_hashes` is present, always call this. Get the VirusTotal reputation verdict (detection ratio, malicious/suspicious vendor count, file type, size, first/last seen).
 7. Call `virustotal_get_ip_report` for each external destination IP found in `entity_context.remote_ips`, `entity_context.network_connections`, or the SentinelOne alert data. **Only call this if a valid IP address string is present — skip if the IP is null, empty, or an internal/RFC-1918 address (10.x, 172.16–31.x, 192.168.x).**
 8. Call `virustotal_get_domain_report` for each domain found in `entity_context.remote_domains`, `entity_context.dns_requests`, or the SentinelOne alert data. **Only call this if a valid non-empty domain string is available — skip if null or empty.**
+   **IMPORTANT: `entity_context.domain` is the endpoint's own Windows AD/workgroup
+   membership (e.g. `"WORKGROUP"`) — it is NOT a network indicator and is never a valid
+   VirusTotal domain lookup. Never pass it here; it will always fail validation. Only use
+   `entity_context.remote_domains` / `entity_context.dns_requests`, or a domain actually
+   observed being contacted in the alert/storyline data.**
 9. Call `get_technique_rollup` to map any MITRE ATT&CK technique IDs from the SentinelOne indicators
 10. Call `list_findings` filtered to the same hostname to check prior alerts on the same endpoint (last 90 days)
 11. Call `nearest_neighbors` to find similar findings by embedding similarity (same hash or same user across the environment)
@@ -146,17 +151,34 @@ or inconclusive.
 3. Call `virustotal_get_file_relationship` to find related samples, dropped files, or parent droppers
 
 **4.2 Process & Command-Line Analysis**
-4. Call `sentinelone_powerquery` to retrieve process events for the Storyline ID. Analyze:
+4. Call `sentinelone_powerquery` to retrieve process events for the Storyline ID.
+   NOTE: `query`, `start_datetime`, and `end_datetime` are ALL required — omitting either
+   datetime fails with "Missing required argument". Use ISO 8601 with a timezone offset
+   (e.g. `2026-07-06T00:00:00Z`); default to a 24-hour window around the detection
+   timestamp unless you have reason to widen it.
+   NOTE: Do NOT hand-write the PowerQuery `query` string yourself — the tool's own
+   documentation says this is unlikely to succeed ("It is very unlikely you know how to
+   write PowerQueries yourself"), and repeated blind syntax guesses here just burn turns.
+   Call `sentinelone_purple_ai` FIRST with a natural-language question describing what
+   you're looking for (e.g. "Show process activity on `<hostname>` around
+   `<detection timestamp>`" — phrase it as a question, NOT as "generate a PowerQuery
+   to..."), then pass the exact query string it returns, unmodified, as
+   `sentinelone_powerquery`'s `query` argument alongside your own `start_datetime`/
+   `end_datetime`.
+   Analyze the results:
    - Parent ↔ child lineage — is the parent expected? (Office spawning PowerShell or cmd is suspicious)
    - Command-line inspection — encoded/obfuscated commands, download cradles, suspicious flags
    - LOLBin abuse — powershell, rundll32, mshta, wmic, certutil, regsvr32, bitsadmin
    - Execution context — user vs SYSTEM, unexpected privilege escalation
 
 **4.3 Storyline Analysis**
-5. Call `sentinelone_powerquery` with the Storyline ID to retrieve the full event chain. From trigger event through all subsequent actions:
+5. Call `sentinelone_powerquery` with the Storyline ID to retrieve the full event chain
+   (same purple_ai-first pattern as step 4 — ask purple_ai for the Storyline's event chain
+   instead of just process events). From trigger event through all subsequent actions:
    - Identify the root cause / initial access vector
    - Map the action sequence to attack stages: Execution → Persistence → Privilege Escalation → Defense Evasion → C2 → Exfiltration
-6. Call `sentinelone_purple_ai` for an AI-assisted storyline summary if available
+6. Call `sentinelone_purple_ai` for an AI-assisted storyline summary if available (a plain
+   question like "Summarize the storyline for `<storyline_id>`" — no PowerQuery generation needed here)
 7. Call `get_technique_rollup` and `create_attack_layer` to produce the MITRE ATT&CK technique mapping for all observed techniques
 
 **4.4 Persistence & Lateral Movement Analysis**
