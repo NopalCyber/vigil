@@ -46,17 +46,21 @@ logger = logging.getLogger(__name__)
 # gate") did not hold across repeated runs, so this catches the
 # self-contradiction in code instead.
 #
-# Deliberately NOT a length/"looks like a full report" check: a genuine,
+# A second, independent check enforces completeness: a genuine,
 # correctly-verdicted True Positive case (case-20260707-2c362c73) had only
-# a 265-char description with no report formatting at all, while a
-# fabricated one (case-20260708-11140562, "confirmed malware... no real
-# supporting evidence") was 127 chars -- almost the same length, so length
-# doesn't discriminate between them and would have false-positived on the
-# genuine case. Catching a fabricated-but-internally-consistent
-# description (asserts a verdict with no contradicting text, but isn't
-# actually backed by the run's evidence) would need grounding against the
-# run's actual tool results, not text pattern matching -- out of scope
-# here; this only catches the model contradicting its own stated verdict.
+# a 265-char description with no report formatting and no mention of
+# "verdict" at all -- the contradiction check alone doesn't catch that,
+# since there's nothing to contradict. Real full reports we've captured
+# ran 1695-1900 chars and always include a "Verdict:" line, so require
+# both a minimum length and that the word appear -- long enough to filter
+# one-liners without being tight enough to reject genuinely shorter (but
+# real) reports we haven't seen yet.
+#
+# Catching a fabricated-but-internally-consistent, full-length description
+# (asserts a verdict with no contradicting text and clears the length bar,
+# but isn't actually backed by the run's evidence) is still out of scope
+# -- that needs grounding against the run's actual tool-call history, not
+# text pattern matching.
 #
 # Scoped to the MCP tool-calling path only (services/mcp_client.py is the
 # single dispatch point every provider path -- Claude and the OpenAI/
@@ -68,6 +72,7 @@ _NON_TP_VERDICT_RE = re.compile(
     r"verdict\**\s*:?\s*\**\s*(validation required|false positive)",
     re.IGNORECASE,
 )
+_MIN_COMPLETE_REPORT_CHARS = 600
 
 
 def _description_contradicts_true_positive(description: Optional[str]) -> bool:
@@ -77,21 +82,45 @@ def _description_contradicts_true_positive(description: Optional[str]) -> bool:
     return bool(_NON_TP_VERDICT_RE.search(description))
 
 
+def _description_is_complete_report(description: Optional[str]) -> bool:
+    """True if ``description`` plausibly is the full 6.1-6.3 report rather
+    than a short, unsupported one-liner."""
+    if not description or len(description) < _MIN_COMPLETE_REPORT_CHARS:
+        return False
+    return "verdict" in description.lower()
+
+
 def _case_action_rejection(tool_name: str, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Return an MCP-style error result if a create_case/escalate_case call
     should be blocked, or None to let it proceed."""
     if tool_name == "create_case":
         description = arguments.get("description") or ""
-        if not _description_contradicts_true_positive(description):
-            return None
-        msg = (
-            "create_case rejected: this report's own Verdict line does not "
-            "say True Positive. Do not call create_case for a False Positive "
-            "or Validation Required verdict -- document the outcome in your "
-            "final report text instead."
-        )
-        logger.warning(f"[mcp-guard] blocked create_case: {arguments.get('title')!r}")
-        return {"error": True, "content": [{"type": "text", "text": msg}]}
+        if _description_contradicts_true_positive(description):
+            msg = (
+                "create_case rejected: this report's own Verdict line does "
+                "not say True Positive. Do not call create_case for a False "
+                "Positive or Validation Required verdict -- document the "
+                "outcome in your final report text instead."
+            )
+            logger.warning(
+                f"[mcp-guard] blocked create_case (contradicts verdict): "
+                f"{arguments.get('title')!r}"
+            )
+            return {"error": True, "content": [{"type": "text", "text": msg}]}
+        if not _description_is_complete_report(description):
+            msg = (
+                "create_case rejected: description must be the full "
+                "investigation report (sections 6.1-6.3, including a "
+                "'**Verdict:** True Positive' line), verbatim -- not a short "
+                "summary. Re-call create_case with the complete report as "
+                "the description."
+            )
+            logger.warning(
+                f"[mcp-guard] blocked create_case (incomplete description, "
+                f"{len(description)} chars): {arguments.get('title')!r}"
+            )
+            return {"error": True, "content": [{"type": "text", "text": msg}]}
+        return None
 
     if tool_name == "escalate_case":
         case_id = arguments.get("case_id")
@@ -104,15 +133,25 @@ def _case_action_rejection(tool_name: str, arguments: Dict[str, Any]) -> Optiona
                 description = (case or {}).get("description") or ""
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[mcp-guard] could not look up case {case_id}: {e}")
-        if not _description_contradicts_true_positive(description):
-            return None
-        msg = (
-            f"escalate_case rejected: case {case_id}'s own report states a "
-            "non-True-Positive verdict -- refusing to notify the account "
-            "owner for a case that isn't actually a confirmed True Positive."
-        )
-        logger.warning(f"[mcp-guard] blocked escalate_case for case_id={case_id}")
-        return {"error": True, "content": [{"type": "text", "text": msg}]}
+        if _description_contradicts_true_positive(description):
+            msg = (
+                f"escalate_case rejected: case {case_id}'s own report states "
+                "a non-True-Positive verdict -- refusing to notify the "
+                "account owner for a case that isn't actually a confirmed "
+                "True Positive."
+            )
+            logger.warning(f"[mcp-guard] blocked escalate_case (contradicts verdict) for case_id={case_id}")
+            return {"error": True, "content": [{"type": "text", "text": msg}]}
+        if not _description_is_complete_report(description):
+            msg = (
+                f"escalate_case rejected: case {case_id}'s description is not "
+                "a complete investigation report -- update the case with the "
+                "full report (sections 6.1-6.3, including a '**Verdict:** "
+                "True Positive' line) via update_case before escalating."
+            )
+            logger.warning(f"[mcp-guard] blocked escalate_case (incomplete description) for case_id={case_id}")
+            return {"error": True, "content": [{"type": "text", "text": msg}]}
+        return None
 
     return None
 

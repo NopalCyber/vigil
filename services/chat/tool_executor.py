@@ -427,7 +427,10 @@ async def _dispatch_findings_tool(
         # tool and the MCP deeptempo-findings.create_case tool share the
         # same name, so a Claude-path agent (which sees both backend and
         # MCP tools at once) could resolve the call to either one.
-        from services.mcp_client import _description_contradicts_true_positive
+        from services.mcp_client import (
+            _description_contradicts_true_positive,
+            _description_is_complete_report,
+        )
 
         description = arguments.get("description", "")
         if _description_contradicts_true_positive(description):
@@ -437,6 +440,16 @@ async def _dispatch_findings_tool(
                     "does not say True Positive. Do not call create_case for "
                     "a False Positive or Validation Required verdict -- "
                     "document the outcome in your final report text instead."
+                )
+            }
+        if not _description_is_complete_report(description):
+            return {
+                "error": (
+                    "create_case rejected: description must be the full "
+                    "investigation report (sections 6.1-6.3, including a "
+                    "'**Verdict:** True Positive' line), verbatim -- not a "
+                    "short summary. Re-call create_case with the complete "
+                    "report as the description."
                 )
             }
         return data_service.create_case(
